@@ -20,10 +20,17 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
 # FE (Netlify) & BE (Railway) hostnames – KHÔNG có protocol ở ALLOWED_HOSTS
 NETLIFY_HOST = os.environ.get("NETLIFY_HOST", "studyappmaze.netlify.app")
-CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "")  # nếu bạn trỏ domain riêng
-ALLOWED_HOSTS = ["backend-studyapp-production.up.railway.app", "localhost", "127.0.0.1",NETLIFY_HOST,]
+# CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "")  # nếu bạn trỏ domain riêng
+ALLOWED_HOSTS = [
+    "backend-studyapp-production.up.railway.app",
+    ".railway.app",   # cho phép tất cả subdomain của railway
+    "localhost",
+    "127.0.0.1",
+]
+CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "")
 if CUSTOM_DOMAIN:
     ALLOWED_HOSTS.append(CUSTOM_DOMAIN)
+
 
 # -----------------------------------------------------------------------------
 # Installed apps & middleware
