@@ -22,7 +22,7 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 NETLIFY_HOST = os.environ.get("NETLIFY_HOST", "studyappmaze.netlify.app")
 # CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "")  # nếu bạn trỏ domain riêng
 ALLOWED_HOSTS = [
-    "backend-studyapp-production.up.railway.app",
+    "backend-studyapp-production.up.railway.app/admin",
     ".railway.app",   # cho phép tất cả subdomain của railway
     "localhost",
     "127.0.0.1",
