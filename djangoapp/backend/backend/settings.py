@@ -137,12 +137,12 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3001",
 ]
 
-# Cookie khi chạy HTTPS trên Railway
+# Cookie cross-site bắt buộc:
 SESSION_COOKIE_SAMESITE = "None"
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SAMESITE = "None"
-CSRF_COOKIE_SECURE = True
-
+CSRF_COOKIE_SAMESITE   = "None"
+SESSION_COOKIE_SECURE  = True          # Railway là HTTPS
+CSRF_COOKIE_SECURE     = True
+CSRF_COOKIE_HTTPONLY   = False         # để FE đọc csrftoken
 
 # Tin cậy header do proxy (Railway) gắn thêm để xác định https
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
