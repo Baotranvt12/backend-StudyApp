@@ -124,18 +124,25 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3001",
 ]
 CORS_ALLOW_CREDENTIALS = True
+CORS_ALLOWED_ORIGINS = [
+    NETLIFY_URL,
+    "http://localhost:3000",
+    "http://localhost:3001",
+]
 
 CSRF_TRUSTED_ORIGINS = [
     NETLIFY_URL,
-    "https://*.railway.app",  # Django 5 hỗ trợ wildcard
+    "https://*.railway.app",  
     "http://localhost:3000",
     "http://localhost:3001",
 ]
 
 # Cookie khi chạy HTTPS trên Railway
-SESSION_COOKIE_SAMESITE = "Lax"
+SESSION_COOKIE_SAMESITE = "None"
 SESSION_COOKIE_SECURE = True
+CSRF_COOKIE_SAMESITE = "None"
 CSRF_COOKIE_SECURE = True
+
 
 # Tin cậy header do proxy (Railway) gắn thêm để xác định https
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
