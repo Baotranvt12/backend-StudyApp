@@ -20,14 +20,13 @@ DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
 # FE (Netlify) & BE (Railway) hostnames – KHÔNG có protocol ở ALLOWED_HOSTS
 NETLIFY_HOST = os.environ.get("NETLIFY_HOST", "studyappmaze.netlify.app")
-# CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "")  # nếu bạn trỏ domain riêng
+# CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "") 
 ALLOWED_HOSTS = [
-    "backend-studyapp-production.up.railway.app/admin",
-    ".railway.app",   # cho phép tất cả subdomain của railway
+    "backend-studyapp-production.up.railway.app",
+    ".railway.app",
     "localhost",
     "127.0.0.1",
 ]
-CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "")
 if CUSTOM_DOMAIN:
     ALLOWED_HOSTS.append(CUSTOM_DOMAIN)
 
@@ -112,52 +111,64 @@ USE_TZ = True
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-# -----------------------------------------------------------------------------
-# CORS / CSRF cho Netlify + Local + Railway
-# -----------------------------------------------------------------------------
-# Dùng origin có protocol ở CORS_ALLOWED_ORIGINS/CSRF_TRUSTED_ORIGINS
+# ----------------------------- CORS / CSRF -----------------------------
 NETLIFY_URL = f"https://{NETLIFY_HOST}"
 
+# FE origins
 CORS_ALLOWED_ORIGINS = [
-    NETLIFY_URL,             # FE Netlify
-    "http://localhost:3000", # local
+    NETLIFY_URL,                 # Netlify prod
+    "https://*.netlify.app",     # Netlify preview
+    "http://localhost:3000",     # local React
     "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://localhost:5173",     # Vite (nếu dùng)
+    "http://127.0.0.1:5173",
 ]
 CORS_ALLOW_CREDENTIALS = True
-CORS_ALLOWED_ORIGINS = [
-    NETLIFY_URL,
-    "http://localhost:3000",
-    "http://localhost:3001",
+# Cho phép các header X-CSRFToken …
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-language",
+    "content-type",
+    "authorization",
+    "x-csrftoken",
+    "x-xsrf-token",
+    "x-requested-with",
 ]
 
+# CSRF: phải liệt kê đầy đủ ORIGIN (có scheme + port)
 CSRF_TRUSTED_ORIGINS = [
     NETLIFY_URL,
-    "https://*.railway.app",  
+    "https://*.netlify.app",
+    "https://*.railway.app",
     "http://localhost:3000",
     "http://localhost:3001",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
 ]
 
-# Cookie cross-site bắt buộc:
+# Cookie cross-site
 SESSION_COOKIE_SAMESITE = "None"
 CSRF_COOKIE_SAMESITE   = "None"
-SESSION_COOKIE_SECURE  = True          # Railway là HTTPS
+SESSION_COOKIE_SECURE  = True
 CSRF_COOKIE_SECURE     = True
-CSRF_COOKIE_HTTPONLY   = False         # để FE đọc csrftoken
+CSRF_COOKIE_HTTPONLY   = False
+CSRF_COOKIE_NAME       = "csrftoken"   # explicit
 
-# Tin cậy header do proxy (Railway) gắn thêm để xác định https
+# Tin cậy proxy HTTPS của Railway
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 
-# -----------------------------------------------------------------------------
-# REST framework (tùy chọn)
-# -----------------------------------------------------------------------------
 REST_FRAMEWORK = {
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
-    # Nếu sau này dùng JWT:
-    # "DEFAULT_AUTHENTICATION_CLASSES": [
-    #     "rest_framework_simplejwt.authentication.JWTAuthentication",
-    # ],
+    # DRF sẽ dùng session + bắt CSRF cho request có session (khi user đăng nhập)
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+    ],
+    "EXCEPTION_HANDLER": "api.exceptions.custom_exception_handler",
 }
 
-#change settings
