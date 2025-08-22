@@ -7,37 +7,33 @@ from pathlib import Path
 import os
 import dj_database_url
 
-# -----------------------------------------------------------------------------
-# Paths
-# -----------------------------------------------------------------------------
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-# -----------------------------------------------------------------------------
-# Core
-# -----------------------------------------------------------------------------
+# ========= Bảo mật / Debug =========
 SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-secret")
 DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
-# FE (Netlify) & BE (Railway) hostnames – KHÔNG có protocol ở ALLOWED_HOSTS
-NETLIFY_HOST = os.environ.get("NETLIFY_HOST", "studyappmaze.netlify.app")
-# CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "") 
+
+CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "").strip()
+
 ALLOWED_HOSTS = [
-    "backend-studyapp-production.up.railway.app",
-    ".railway.app",
-    "localhost",
-    "127.0.0.1",
+    "localhost", "127.0.0.1",
+    ".railway.app",                      # wildcard cho Railway
 ]
 if CUSTOM_DOMAIN:
     ALLOWED_HOSTS.append(CUSTOM_DOMAIN)
 
 
-# -----------------------------------------------------------------------------
-# Installed apps & middleware
-# -----------------------------------------------------------------------------
+SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+USE_X_FORWARDED_HOST = True
+
+# ========= Ứng dụng =========
 INSTALLED_APPS = [
     "corsheaders",
     "rest_framework",
-    "api",
+    "api",              
+
     "django.contrib.admin",
     "django.contrib.auth",
     "django.contrib.contenttypes",
@@ -46,10 +42,11 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
 ]
 
+# ========= Middleware =========
 MIDDLEWARE = [
-    "corsheaders.middleware.CorsMiddleware",
+    "corsheaders.middleware.CorsMiddleware",            
     "django.middleware.security.SecurityMiddleware",
-    "whitenoise.middleware.WhiteNoiseMiddleware",  # phục vụ static trên Railway
+    "whitenoise.middleware.WhiteNoiseMiddleware",       
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -58,19 +55,13 @@ MIDDLEWARE = [
     "django.middleware.clickjacking.XFrameOptionsMiddleware",
 ]
 
-# Django project entry points
 ROOT_URLCONF = "backend.urls"
-WSGI_APPLICATION = "backend.wsgi.application"
-# Nếu dùng ASGI, giữ thêm:
-ASGI_APPLICATION = "backend.asgi.application"
 
-# -----------------------------------------------------------------------------
-# Templates
-# -----------------------------------------------------------------------------
+# ========= Templates =========
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "templates"],  # có thể để [] nếu không có template riêng
+        "DIRS": [BASE_DIR / "templates"],               # nếu không dùng, có thể để []
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -83,92 +74,77 @@ TEMPLATES = [
     },
 ]
 
-# -----------------------------------------------------------------------------
-# Database (Railway: tự bơm DATABASE_URL; Local: fallback SQLite)
-# -----------------------------------------------------------------------------
+WSGI_APPLICATION = "backend.wsgi.application"
+
+# ========= Database =========
+# Nếu không có DATABASE_URL (trên Railway sẽ có), fallback về sqlite
 DATABASES = {
     "default": dj_database_url.config(
-        default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
+        default=f"sqlite:///{BASE_DIR/'db.sqlite3'}",
         conn_max_age=600,
         ssl_require=False,
     )
 }
 
-# -----------------------------------------------------------------------------
-# Static files (Whitenoise)
-# -----------------------------------------------------------------------------
-STATIC_URL = "/static/"
-STATIC_ROOT = BASE_DIR / "staticfiles"
-STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
+# ========= Password validation =========
+AUTH_PASSWORD_VALIDATORS = [
+    {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
+    {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
+    {"NAME": "django.contrib.auth.password_validation.CommonPasswordValidator"},
+    {"NAME": "django.contrib.auth.password_validation.NumericPasswordValidator"},
+]
 
-# -----------------------------------------------------------------------------
-# Internationalization
-# -----------------------------------------------------------------------------
+# ========= I18N / TZ =========
 LANGUAGE_CODE = "en-us"
 TIME_ZONE = "UTC"
 USE_I18N = True
 USE_TZ = True
 
-DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
+# ========= Static (WhiteNoise) =========
+STATIC_URL = "/static/"
+STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
+STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
-# ----------------------------- CORS / CSRF -----------------------------
-NETLIFY_URL = f"https://{NETLIFY_HOST}"
+# ========= CORS / CSRF =========
+# Domain FE Netlify
+NETLIFY_URL = os.environ.get("NETLIFY_URL", "https://studyappmaze.netlify.app")
 
-# FE origins
 CORS_ALLOWED_ORIGINS = [
-    NETLIFY_URL,                 # Netlify prod
-    "https://*.netlify.app",     # Netlify preview
-    "http://localhost:3000",     # local React
-    "http://localhost:3001",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
-    "http://localhost:5173",     # Vite (nếu dùng)
-    "http://127.0.0.1:5173",
-]
-CORS_ALLOW_CREDENTIALS = True
-# Cho phép các header X-CSRFToken …
-CORS_ALLOW_HEADERS = [
-    "accept",
-    "accept-language",
-    "content-type",
-    "authorization",
-    "x-csrftoken",
-    "x-xsrf-token",
-    "x-requested-with",
-]
-
-# CSRF: phải liệt kê đầy đủ ORIGIN (có scheme + port)
-CSRF_TRUSTED_ORIGINS = [
-    NETLIFY_URL,
-    "https://*.netlify.app",
-    "https://*.railway.app",
     "http://localhost:3000",
     "http://localhost:3001",
-    "http://127.0.0.1:3000",
-    "http://127.0.0.1:3001",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
+    NETLIFY_URL,
+]
+CORS_ALLOW_CREDENTIALS = True
+
+# Cho phép gửi form/cookie cross-site (Netlify -> Railway)
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://backend-studyapp-production.up.railway.app",  # domain Railway thực tế
+    NETLIFY_URL,
 ]
 
-# Cookie cross-site
+# Cookie cross-site bắt buộc khi FE/BE khác domain
 SESSION_COOKIE_SAMESITE = "None"
 CSRF_COOKIE_SAMESITE   = "None"
-SESSION_COOKIE_SECURE  = True
+SESSION_COOKIE_SECURE  = True        # Railway dùng HTTPS
 CSRF_COOKIE_SECURE     = True
-CSRF_COOKIE_HTTPONLY   = False
-CSRF_COOKIE_NAME       = "csrftoken"   # explicit
+CSRF_COOKIE_HTTPONLY   = False       # để FE đọc csrftoken
 
-# Tin cậy proxy HTTPS của Railway
-SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
-
+# ========= Django REST Framework =========
 REST_FRAMEWORK = {
+    
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.SessionAuthentication",
+        "rest_framework.authentication.BasicAuthentication",
+    ],
+    
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.AllowAny",
     ],
-    # DRF sẽ dùng session + bắt CSRF cho request có session (khi user đăng nhập)
-    "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework.authentication.SessionAuthentication",
-    ],
+    #Custom exception handler
     "EXCEPTION_HANDLER": "api.exceptions.custom_exception_handler",
 }
 
+# ========= Mặc định primary key =========
+DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
