@@ -11,22 +11,64 @@ import dj_database_url
 BASE_DIR = Path(__file__).resolve().parent.parent
 
 # ========= Bảo mật / Debug =========
-SECRET_KEY = os.environ.get("DJANGO_SECRET_KEY", "dev-secret")
+SECRET_KEY = (
+    os.environ.get("DJANGO_SECRET_KEY")
+    or os.environ.get("SECRET_KEY")
+    or "dev-secret"
+)
 DEBUG = os.environ.get("DJANGO_DEBUG", "false").lower() == "true"
 
-
 CUSTOM_DOMAIN = os.environ.get("CUSTOM_DOMAIN", "").strip()
+RAILWAY_URL = os.environ.get("RAILWAY_URL") or os.environ.get("RAILWAY_PUBLIC_DOMAIN")
+NETLIFY_URL = os.environ.get("NETLIFY_URL", "https://studyappmaze.netlify.app")
 
-ALLOWED_HOSTS = [
-    "localhost", "127.0.0.1",
-    ".railway.app",                      # wildcard cho Railway
-]
+ALLOWED_HOSTS = ["localhost", "127.0.0.1", ".railway.app"]
 if CUSTOM_DOMAIN:
     ALLOWED_HOSTS.append(CUSTOM_DOMAIN)
 
-
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
 USE_X_FORWARDED_HOST = True
+
+# --- Database ---
+DATABASES = {
+    "default": dj_database_url.config(
+        default=f"sqlite:///{BASE_DIR/'db.sqlite3'}",
+        conn_max_age=600,
+        ssl_require=True,
+    )
+}
+
+# --- Static / WhiteNoise ---
+STATIC_URL = "/static/"
+STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
+if not DEBUG:
+    STATICFILES_STORAGE = "whitenoise.storage.CompressedStaticFilesStorage"
+
+# --- CORS / CSRF ---
+CORS_ALLOWED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    NETLIFY_URL,
+]
+CORS_ALLOWED_ORIGIN_REGEXES = [r"^https://.*--studyappmaze\.netlify\.app$"]
+CORS_ALLOW_CREDENTIALS = True
+
+CSRF_TRUSTED_ORIGINS = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "https://backend-studyapp-production.up.railway.app",
+    NETLIFY_URL,
+]
+if CUSTOM_DOMAIN:
+    CSRF_TRUSTED_ORIGINS.append(f"https://{CUSTOM_DOMAIN}")
+if RAILWAY_URL:
+    CSRF_TRUSTED_ORIGINS.append(f"https://{RAILWAY_URL}")
+
+SESSION_COOKIE_SAMESITE = "None"
+CSRF_COOKIE_SAMESITE   = "None"
+SESSION_COOKIE_SECURE  = True
+CSRF_COOKIE_SECURE     = True
+CSRF_COOKIE_HTTPONLY   = False
 
 # ========= Ứng dụng =========
 INSTALLED_APPS = [
@@ -105,31 +147,31 @@ STATIC_URL = "/static/"
 STATIC_ROOT = os.path.join(BASE_DIR, "staticfiles")
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
-# ========= CORS / CSRF =========
-# Domain FE Netlify
-NETLIFY_URL = os.environ.get("NETLIFY_URL", "https://studyappmaze.netlify.app")
+# # ========= CORS / CSRF =========
+# # Domain FE Netlify
+# NETLIFY_URL = os.environ.get("NETLIFY_URL", "https://studyappmaze.netlify.app")
 
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    NETLIFY_URL,
-]
-CORS_ALLOW_CREDENTIALS = True
+# CORS_ALLOWED_ORIGINS = [
+#     "http://localhost:3000",
+#     "http://localhost:3001",
+#     NETLIFY_URL,
+# ]
+# CORS_ALLOW_CREDENTIALS = True
 
-# Cho phép gửi form/cookie cross-site (Netlify -> Railway)
-CSRF_TRUSTED_ORIGINS = [
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "https://backend-studyapp-production.up.railway.app",  # domain Railway thực tế
-    NETLIFY_URL,
-]
+# # Cho phép gửi form/cookie cross-site (Netlify -> Railway)
+# CSRF_TRUSTED_ORIGINS = [
+#     "http://localhost:3000",
+#     "http://localhost:3001",
+#     "https://backend-studyapp-production.up.railway.app",  # domain Railway thực tế
+#     NETLIFY_URL,
+# ]
 
-# Cookie cross-site bắt buộc khi FE/BE khác domain
-SESSION_COOKIE_SAMESITE = "None"
-CSRF_COOKIE_SAMESITE   = "None"
-SESSION_COOKIE_SECURE  = True        # Railway dùng HTTPS
-CSRF_COOKIE_SECURE     = True
-CSRF_COOKIE_HTTPONLY   = False       # để FE đọc csrftoken
+# # Cookie cross-site bắt buộc khi FE/BE khác domain
+# SESSION_COOKIE_SAMESITE = "None"
+# CSRF_COOKIE_SAMESITE   = "None"
+# SESSION_COOKIE_SECURE  = True        # Railway dùng HTTPS
+# CSRF_COOKIE_SECURE     = True
+# CSRF_COOKIE_HTTPONLY   = False       # để FE đọc csrftoken
 
 # ========= Django REST Framework =========
 REST_FRAMEWORK = {
