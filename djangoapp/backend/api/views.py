@@ -96,23 +96,32 @@ def generate_learning_path(request):
         
         # Prompt
         messages = [
-            {
-                "role": "system",
-                "content": "Bạn là chuyên gia lập kế hoạch tự học. Trả lời HOÀN TOÀN bằng tiếng Việt."
-            },
-            {
-                "role": "user",
-                "content": f"""
-Hãy lập kế hoạch tự học 4 tuần cho học sinh lớp {class_level} muốn cải thiện môn {subject}.
+    {
+        "role": "system",
+        "content": (
+            "Bạn là chuyên gia lập kế hoạch tự học. Trả lời HOÀN TOÀN bằng tiếng Việt."
+        ),
+    },
+    {
+        "role": "user",
+        "content": f"""
+Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} muốn cải thiện môn {subject}.
 Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
-Trả lời theo đúng format sau:
-Tuần 1:
-Ngày 1: [Nội dung học] | Link tài liệu: [link]
-...
-Ngày 28: ...
-"""
-            }
-        ]
+
+YÊU CẦU BẮT BUỘC:
+- Trả lời CHÍNH XÁC 28 dòng, mỗi dòng 1 ngày.
+- KHÔNG thêm tiêu đề, KHÔNG markdown, KHÔNG code block.
+- Định dạng MỖI DÒNG: "Ngày N: <nội dung ngắn gọn> | Link tài liệu: <URL>"
+- <URL> phải bắt đầu bằng http(s)://. Nếu không có nguồn phù hợp, ghi "không có".
+- Chỉ in các dòng "Ngày 1"… "Ngày 28". Không in bất kỳ nội dung nào khác.
+
+Ví dụ:
+Ngày 1: Ôn kiến thức A | Link tài liệu: https://example.com/tai-lieu-A
+Ngày 2: ...
+... đến Ngày 28
+""",
+    },
+]
         
         # Call LLM with better error handling
         logger.info("Calling DeepInfra API...")
