@@ -105,20 +105,16 @@ def generate_learning_path(request):
     {
         "role": "user",
         "content": f"""
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} muốn cải thiện môn {subject}.
+Bạn là một trợ lý học tập. Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} muốn cải thiện môn {subject}.
 Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 
 YÊU CẦU BẮT BUỘC:
 - Trả lời CHÍNH XÁC 28 dòng, mỗi dòng 1 ngày.
-- KHÔNG thêm tiêu đề, KHÔNG markdown, KHÔNG code block.
+- KHÔNG thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
 - Định dạng MỖI DÒNG: "Ngày N: <nội dung ngắn gọn> | Link tài liệu: <URL>"
-- <URL> phải bắt đầu bằng http(s)://. Nếu không có nguồn phù hợp, ghi "không có".
+- <URL> phải bắt đầu bằng http(s)://, và phải là link tài liệu, video bài giảng hoặc nguồn tham khảo mà người học có thể mở được.
+- Nếu không tìm được nguồn phù hợp, ghi "không có".
 - Chỉ in các dòng "Ngày 1"… "Ngày 28". Không in bất kỳ nội dung nào khác.
-
-Ví dụ:
-Ngày 1: Ôn kiến thức A | Link tài liệu: https://example.com/tai-lieu-A
-Ngày 2: ...
-... đến Ngày 28
 """,
     },
 ]
