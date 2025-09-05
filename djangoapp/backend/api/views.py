@@ -105,18 +105,24 @@ def generate_learning_path(request):
     {
         "role": "user",
         "content": f"""
-Bạn hãy đóng vai là một trợ lý học tập chuyên nghiệp dành cho học sinh.  
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} muốn cải thiện môn {subject}.  
-Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.  
+Bạn là một trợ lý học tập chuyên nghiệp có hơn 10 năm kinh nghiệm hỗ trợ học sinh.
+Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} theo đúng chương trình GDPT 2018 của Bộ Giáo dục và Đào tạo, nhằm cải thiện môn {subject}.
+Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 
-YÊU CẦU:  
-- Trả lời CHÍNH XÁC 28 dòng, mỗi dòng 1 ngày.  
-- KHÔNG thêm tiêu đề, KHÔNG markdown, KHÔNG code block.  
-- Định dạng MỖI DÒNG: "Ngày N: <nội dung ngắn gọn> | Link tài liệu: <URL hoặc Từ khóa tìm kiếm>"  
-- <URL> phải bắt đầu bằng http(s):// nếu là link thực tế (ví dụ YouTube, website học tập, tài liệu mở).  
-- Nếu không có link tài liệu phù hợp, thay thế bằng gợi ý TỪ KHÓA TÌM KIẾM trên Google hoặc Youtube (viết rõ “Tìm với từ khóa ...”).  
-- Xen kẽ giữa link tài liệu có sẵn và từ khóa tìm kiếm để học sinh vừa có nguồn học, vừa tập thói quen tự tìm kiếm.  
-- Chỉ in các dòng "Ngày 1"… "Ngày 28". Không in bất kỳ nội dung nào khác. 
+YÊU CẦU BẮT BUỘC:
+
+Trả lời CHÍNH XÁC 28 dòng, mỗi dòng 1 ngày.
+
+Nội dung học mỗi ngày phải bám sát chương trình GDPT 2018 theo cấp học và môn {subject}, có độ khó tăng dần từ cơ bản đến nâng cao.
+
+Ngày 28 phải là phần tổng kết, ôn tập toàn bộ và làm bài kiểm tra tổng hợp.
+
+KHÔNG thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
+
+Định dạng MỖI DÒNG:
+"Ngày N: <nội dung ngắn gọn> | TỪ KHÓA TÌM KIẾM: Tìm với từ khóa ... | Bài tập tự luyện: <mô tả ngắn có liên quan thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng hoặc công cụ số phù hợp với môn {subject}>"
+
+Chỉ in các dòng "Ngày 1"… "Ngày 28". Không in bất kỳ nội dung nào khác.
 """,
     },
 ]
@@ -125,7 +131,7 @@ YÊU CẦU:
         logger.info("Calling DeepInfra API...")
         try:
             resp = openai.chat.completions.create(
-                model="openchat/openchat_3.5",
+                model="openchat/openchat-3.6-8b",
                 messages=messages,
                 stream=False,
                 max_tokens=2000,  # Limit response length
