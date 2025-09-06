@@ -110,11 +110,11 @@ Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 YÊU CẦU:
 - Xuất ra CHÍNH XÁC 28 dòng (tương ứng Ngày 1 → Ngày 28). 
 - Mỗi dòng là một hoạt động học ngắn gọn, theo tiến trình từ cơ bản đến nâng cao. 
-- Nội dung bám sát định hướng chương trình GDPT 2018 nhưng phải do bạn TỰ SOẠN mới hoàn toàn (không sao chép sách giáo khoa). 
+- Nội dung theo chương trình Giáo dục phổ thông 2018 của Bộ Giáo dục và Đào tạo. 
 - Ngày 28 phải là phần ÔN TẬP & KIỂM TRA TỔNG HỢP. 
 - KHÔNG in thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
 Định dạng MỖI DÒNG:
-Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số liên quan đến môn {subject}>
+Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số học tập liên quan đến môn {subject}>
 Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
 """,
     },
@@ -124,7 +124,7 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
         logger.info("Calling DeepInfra API...")
         try:
             resp = openai.chat.completions.create(
-                model="openchat/openchat-3.6-8b",
+                model="openchat/openchat_3.5",
                 messages=messages,
                 stream=False,
                 max_tokens=2000,  # Limit response length
