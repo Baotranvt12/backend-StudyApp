@@ -99,30 +99,23 @@ def generate_learning_path(request):
     {
         "role": "system",
         "content": (
-            "Bạn là chuyên gia lập kế hoạch tự học. Trả lời HOÀN TOÀN bằng tiếng Việt."
+            "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
         ),
     },
     {
         "role": "user",
         "content": f"""
-Bạn là một trợ lý học tập chuyên nghiệp có hơn 10 năm kinh nghiệm hỗ trợ học sinh.
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} theo đúng chương trình GDPT 2018 của Bộ Giáo dục và Đào tạo, nhằm cải thiện môn {subject}.
+Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}. 
 Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
-
-YÊU CẦU BẮT BUỘC:
-
-Trả lời CHÍNH XÁC 28 dòng, mỗi dòng 1 ngày.
-
-Nội dung học mỗi ngày phải bám sát chương trình GDPT 2018 theo cấp học và môn {subject}, có độ khó tăng dần từ cơ bản đến nâng cao.
-
-Ngày 28 phải là phần tổng kết, ôn tập toàn bộ và làm bài kiểm tra tổng hợp.
-
-KHÔNG thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
-
+YÊU CẦU:
+- Xuất ra CHÍNH XÁC 28 dòng (tương ứng Ngày 1 → Ngày 28). 
+- Mỗi dòng là một hoạt động học ngắn gọn, theo tiến trình từ cơ bản đến nâng cao. 
+- Nội dung bám sát định hướng chương trình GDPT 2018 nhưng phải do bạn TỰ SOẠN mới hoàn toàn (không sao chép sách giáo khoa). 
+- Ngày 28 phải là phần ÔN TẬP & KIỂM TRA TỔNG HỢP. 
+- KHÔNG in thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
 Định dạng MỖI DÒNG:
-"Ngày N: <nội dung ngắn gọn> | TỪ KHÓA TÌM KIẾM: Tìm với từ khóa ... | Bài tập tự luyện: <mô tả ngắn có liên quan thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng hoặc công cụ số phù hợp với môn {subject}>"
-
-Chỉ in các dòng "Ngày 1"… "Ngày 28". Không in bất kỳ nội dung nào khác.
+Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số liên quan đến môn {subject}>
+Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
 """,
     },
 ]
