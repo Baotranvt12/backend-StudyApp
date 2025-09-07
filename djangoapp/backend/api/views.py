@@ -174,33 +174,35 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
                 status=500
             )
         
-        # Parse "Ngày N: ..."
-        day_line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–]\s*(.+)$", re.IGNORECASE)
+        # === Parse "Ngày N: ..." lines ===
+        line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
         plan = {}
-        
-        for raw in gpt_text_vi.splitlines():
-            line = raw.strip()
+
+        for raw_line in gpt_text_vi.splitlines():
+            line = raw_line.strip()
             if not line:
                 continue
-            m = day_line_regex.match(line)
+            m = line_regex.match(line)
             if not m:
                 continue
-            day_num = int(m.group(1))
+            try:
+                day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
+            except Exception:
+                continue
             if 1 <= day_num <= 28:
-                plan[day_num] = m.group(2).strip()
-        
+                # Giữ toàn bộ dòng
+                plan[day_num] = line
+
         logger.info(f"Parsed {len(plan)} days from GPT response")
-        
-        if not plan:
-            logger.error("Could not parse any days from GPT response")
-            logger.error(f"First 500 chars of response: {gpt_text_vi[:500]}")
-            
-            # Fallback: Create a simple default plan
-            logger.info("Using fallback plan generation")
+
+        # Validate đủ 28 ngày
+        if len(plan) != 28:
+            logger.warning(f"Expected 28 days but got {len(plan)}. Fallback to default plan.")
+            plan = {}
             for day in range(1, 29):
                 week = (day - 1) // 7 + 1
-                plan[day] = f"Tuần {week} - Ngày {day}: Học {subject} - {goal}"
-        
+                plan[day] = f"Ngày {day}: Học {subject} - Ôn tập/chủ đề liên quan {goal} | TỪ KHÓA TÌM KIẾM: {subject} {goal} | Bài tập tự luyện: Thực hành 15 phút | CÔNG CỤ HỖ TRỢ: Google Classroom"
+       
         # Save to DB (per user & subject)
         user = request.user
         try:
