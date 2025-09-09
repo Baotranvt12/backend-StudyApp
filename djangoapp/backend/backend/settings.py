@@ -61,6 +61,18 @@ CORS_ALLOWED_ORIGIN_REGEXES = [
 
 CORS_ALLOW_CREDENTIALS = True
 
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "accept-encoding",
+    "authorization",
+    "content-type",
+    "dnt",
+    "origin",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+]
+
 # ========= CSRF Configuration =========
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
@@ -68,6 +80,8 @@ CSRF_TRUSTED_ORIGINS = [
     "https://backend-studyapp-production.up.railway.app",
     NETLIFY_URL,
 ]
+
+
 
 if CUSTOM_DOMAIN:
     CSRF_TRUSTED_ORIGINS.append(f"https://{CUSTOM_DOMAIN}")
@@ -101,9 +115,9 @@ INSTALLED_APPS = [
 
 # ========= Middleware =========
 MIDDLEWARE = [
+    "corsheaders.middleware.CorsMiddleware",      
     "django.middleware.security.SecurityMiddleware",
-    "corsheaders.middleware.CorsMiddleware",  # Must be before CommonMiddleware
-    "whitenoise.middleware.WhiteNoiseMiddleware",  # Serve static files
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
