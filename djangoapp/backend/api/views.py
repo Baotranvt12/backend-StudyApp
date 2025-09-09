@@ -14,6 +14,8 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from openai import OpenAI
+from openai import APIConnectionError, APIError, RateLimitError, AuthenticationError
+import httpx
 
 from .models import ProgressLog
 from .serializers import (
@@ -137,32 +139,69 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
         ]
 
         # --- Call DeepInfra safely ---
+                # --- Call DeepInfra safely ---
+        client = get_openai_client()
         try:
-            client = get_openai_client()
             resp = client.chat.completions.create(
-                model="openchat/openchat_3.5",  # confirm model/quota trên DeepInfra
+                model="openchat/openchat_3.5",  # xác nhận model còn quota
                 messages=messages,
                 stream=False,
                 max_tokens=2000,
                 temperature=0.7,
-                timeout=60,  # tránh treo httpx
+                timeout=60,  # tránh treo httpx nếu DeepInfra chậm
             )
-        except Exception as api_error:
-            msg = str(api_error)
-            logger.exception("DeepInfra API error: %s", msg)
 
-            lower = msg.lower()
-            if "401" in lower or "unauthorized" in lower or "api key" in lower:
-                return Response(
-                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."},
-                    status=status.HTTP_401_UNAUTHORIZED,
-                )
-            if "429" in lower or "rate" in lower or "quota" in lower:
-                return Response(
-                    {"error": "Đã vượt quá giới hạn API. Vui lòng thử lại sau."},
-                    status=status.HTTP_429_TOO_MANY_REQUESTS,
-                )
-            # lỗi kết nối/service
+        # ====== BẮT LỖI CHUYÊN BIỆT ======
+        except AuthenticationError as e:
+            # Sai/thiếu API key
+            logger.error("DeepInfra auth error: %s", e)
+            return Response(
+                {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."},
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+
+        except RateLimitError as e:
+            # Hết quota/giới hạn tốc độ
+            logger.warning("DeepInfra rate limit: %s", e)
+            return Response(
+                {"error": "Đã vượt quá giới hạn API. Vui lòng thử lại sau."},
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        except APIConnectionError as e:
+            # Không kết nối được tới DeepInfra
+            logger.error("DeepInfra connection error: %s", e)
+            return Response(
+                {"error": "Không kết nối được tới AI service (network)."},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        except httpx.ConnectTimeout as e:
+            logger.error("DeepInfra connect timeout: %s", e)
+            return Response(
+                {"error": "Kết nối AI service quá thời gian chờ (connect timeout)."},
+                status=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+
+        except httpx.ReadTimeout as e:
+            logger.error("DeepInfra read timeout: %s", e)
+            return Response(
+                {"error": "AI service phản hồi quá chậm (read timeout)."},
+                status=status.HTTP_504_GATEWAY_TIMEOUT,
+            )
+
+        except APIError as e:
+            # Các lỗi 5xx từ phía service
+            logger.error("DeepInfra APIError: %s", e)
+            return Response(
+                {"error": "AI service gặp sự cố.", "details": str(e)[:200]},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        except Exception as api_error:
+            # Phòng hờ mọi trường hợp khác để không rơi ra ngoài
+            msg = str(api_error)
+            logger.exception("DeepInfra unknown error: %s", msg)
             return Response(
                 {"error": "Lỗi khi gọi AI service", "details": msg[:200]},
                 status=status.HTTP_502_BAD_GATEWAY,
