@@ -1,15 +1,20 @@
 import os
 import re
 import logging
+from functools import lru_cache
+
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
+from django.views.decorators.csrf import ensure_csrf_cookie
+
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
-from django.views.decorators.csrf import ensure_csrf_cookie
+
 from openai import OpenAI
+
 from .models import ProgressLog
 from .serializers import (
     ProgressLogSerializer,
@@ -17,39 +22,51 @@ from .serializers import (
     UserSerializer,
 )
 
-# Setup logging
+# =========================
+# Logging & helpers
+# =========================
 logger = logging.getLogger(__name__)
 
+def _env_true(v, default=False):
+    if v is None:
+        return default
+    return str(v).lower() in ("1", "true", "yes", "y", "on")
+
+IS_DEBUG = _env_true(os.environ.get("DJANGO_DEBUG"), default=False)
+
+
 # =========================
-# OpenAI (DeepInfra) client
+# OpenAI (DeepInfra) client - LAZY INIT
 # =========================
-DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
+@lru_cache(maxsize=1)
+def get_openai_client() -> OpenAI:
+    """
+    Khởi tạo client khi thực sự cần.
+    - Prod: yêu cầu DEEPINFRA_API_KEY
+    - Dev: cho phép dùng DEEPINFRA_DEV_KEY (nếu không có thì raise)
+    """
+    api_key = os.environ.get("DEEPINFRA_API_KEY")
+    if not api_key:
+        if IS_DEBUG:
+            api_key = os.environ.get("DEEPINFRA_DEV_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "DEV mode: missing DEEPINFRA_DEV_KEY for DeepInfra."
+                )
+            logger.warning("Using DEV DeepInfra key (DEV only).")
+        else:
+            raise RuntimeError("DEEPINFRA_API_KEY is missing in production.")
 
-# Log để debug
-logger.info(f"DEEPINFRA_API_KEY exists: {bool(DEEPINFRA_API_KEY)}")
-if DEEPINFRA_API_KEY:
-    logger.info(f"API Key length: {len(DEEPINFRA_API_KEY)}")
-    logger.info(f"API Key first 10 chars: {DEEPINFRA_API_KEY[:10]}...")
+    try:
+        client = OpenAI(
+            api_key=api_key,
+            base_url="https://api.deepinfra.com/v1/openai",
+        )
+        return client
+    except Exception:
+        logger.exception("Failed to initialize OpenAI (DeepInfra) client")
+        raise
 
-if not DEEPINFRA_API_KEY:
-    logger.error("DEEPINFRA_API_KEY environment variable is not set!")
-    # Trong development, có thể dùng một key mặc định
-    # Nhưng trong production PHẢI raise error
-    if os.environ.get("DJANGO_DEBUG", "false").lower() == "true":
-        logger.warning("Using default API key for development only!")
-        DEEPINFRA_API_KEY = "your_development_key_here"
-    else:
-        raise ValueError("DEEPINFRA_API_KEY environment variable is required in production")
-
-try:
-    openai = OpenAI(
-        api_key=DEEPINFRA_API_KEY,
-        base_url="https://api.deepinfra.com/v1/openai",
-    )
-    logger.info("OpenAI client initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize OpenAI client: {e}")
-    raise
 
 # =========================
 # Helpers
@@ -60,6 +77,7 @@ def normalize_status(value: str) -> str:
         return "pending"
     v = value.strip().lower()
     return "done" if v == "done" else "pending"
+
 
 # =========================================
 # Generate learning path (store per-user)
@@ -77,34 +95,32 @@ def generate_learning_path(request):
     }
     """
     try:
-        # Log request data
-        logger.info(f"generate_learning_path called by user: {request.user.username}")
-        logger.info(f"Request data: {request.data}")
-        
+        logger.info("generate_learning_path called by %s", request.user.username)
+        logger.debug("Request data: %s", request.data)
+
         data = request.data
         class_level = (data.get("class_level") or "").strip()
         subject = (data.get("subject") or "").strip()
         study_time = (data.get("study_time") or "").strip()
         goal = (data.get("goal") or "").strip()
-        
+
         if not all([class_level, subject, study_time, goal]):
-            logger.warning("Missing required fields")
             return Response(
-                {"error": "Thiếu thông tin bắt buộc."}, 
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "Thiếu thông tin bắt buộc."},
+                status=status.HTTP_400_BAD_REQUEST,
             )
-        
-        # Prompt
+
         messages = [
-    {
-        "role": "system",
-        "content": (
-            "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
-        ),
-    },
-    {
-        "role": "user",
-        "content": f"""
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm "
+                    "thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
 Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}. 
 Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 YÊU CẦU:
@@ -117,64 +133,58 @@ YÊU CẦU:
 Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số học tập liên quan đến môn {subject}>
 Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
 """,
-    },
-]
-        
-        # Call LLM with better error handling
-        logger.info("Calling DeepInfra API...")
+            },
+        ]
+
+        # --- Call DeepInfra safely ---
         try:
-            resp = openai.chat.completions.create(
-                model="openchat/openchat_3.5",
+            client = get_openai_client()
+            resp = client.chat.completions.create(
+                model="openchat/openchat_3.5",  # confirm model/quota trên DeepInfra
                 messages=messages,
                 stream=False,
-                max_tokens=2000,  # Limit response length
-                temperature=0.7   # Add some creativity
+                max_tokens=2000,
+                temperature=0.7,
+                timeout=60,  # tránh treo httpx
             )
-            logger.info("DeepInfra API call successful")
         except Exception as api_error:
-            logger.error(f"DeepInfra API error: {str(api_error)}")
-            logger.error(f"Error type: {type(api_error).__name__}")
-            
-            # Check specific error types
-            error_message = str(api_error)
-            if "api_key" in error_message.lower():
+            msg = str(api_error)
+            logger.exception("DeepInfra API error: %s", msg)
+
+            lower = msg.lower()
+            if "401" in lower or "unauthorized" in lower or "api key" in lower:
                 return Response(
-                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."}, 
-                    status=500
+                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."},
+                    status=status.HTTP_401_UNAUTHORIZED,
                 )
-            elif "rate" in error_message.lower():
+            if "429" in lower or "rate" in lower or "quota" in lower:
                 return Response(
-                    {"error": "Đã vượt quá giới hạn API. Vui lòng thử lại sau."}, 
-                    status=429
+                    {"error": "Đã vượt quá giới hạn API. Vui lòng thử lại sau."},
+                    status=status.HTTP_429_TOO_MANY_REQUESTS,
                 )
-            else:
-                return Response(
-                    {
-                        "error": "Lỗi khi gọi AI service",
-                        "details": str(api_error)[:200]  # Limit error message length
-                    }, 
-                    status=500
-                )
-        
-        # Parse response
+            # lỗi kết nối/service
+            return Response(
+                {"error": "Lỗi khi gọi AI service", "details": msg[:200]},
+                status=status.HTTP_502_BAD_GATEWAY,
+            )
+
+        # --- Parse response ---
         try:
             gpt_text_vi = (resp.choices[0].message.content or "").strip()
-            logger.info(f"GPT response length: {len(gpt_text_vi)}")
-            
             if not gpt_text_vi:
-                logger.error("Empty response from GPT")
+                logger.error("Empty response from LLM")
                 return Response(
-                    {"error": "Không nhận được phản hồi từ AI"}, 
-                    status=500
+                    {"error": "Không nhận được phản hồi từ AI"},
+                    status=status.HTTP_502_BAD_GATEWAY,
                 )
-        except Exception as parse_error:
-            logger.error(f"Error parsing GPT response: {parse_error}")
+        except Exception:
+            logger.exception("Error parsing LLM response")
             return Response(
-                {"error": "Lỗi xử lý phản hồi từ AI"}, 
-                status=500
+                {"error": "Lỗi xử lý phản hồi từ AI"},
+                status=status.HTTP_502_BAD_GATEWAY,
             )
-        
-        # === Parse "Ngày N: ..." lines ===
+
+        # --- Parse 28 lines "Ngày N: ..." ---
         line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
         plan = {}
 
@@ -186,86 +196,84 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
             if not m:
                 continue
             try:
-                day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
+                day_num = int(m.group(1))
             except Exception:
                 continue
             if 1 <= day_num <= 28:
-                # Giữ toàn bộ dòng
                 plan[day_num] = line
 
-        logger.info(f"Parsed {len(plan)} days from GPT response")
+        logger.info("Parsed %d day lines", len(plan))
 
-        # Validate đủ 28 ngày
+        # Fallback nếu không đủ 28 dòng
         if len(plan) != 28:
-            logger.warning(f"Expected 28 days but got {len(plan)}. Fallback to default plan.")
+            logger.warning("Expected 28 lines, got %d. Fallback default plan.", len(plan))
             plan = {}
             for day in range(1, 29):
                 week = (day - 1) // 7 + 1
-                plan[day] = f"Ngày {day}: Học {subject} - Ôn tập/chủ đề liên quan {goal} | TỪ KHÓA TÌM KIẾM: {subject} {goal} | Bài tập tự luyện: Thực hành 15 phút | CÔNG CỤ HỖ TRỢ: Google Classroom"
-       
-        # Save to DB (per user & subject)
+                plan[day] = (
+                    f"Ngày {day}: Học {subject} - Ôn tập/chủ đề liên quan {goal} | "
+                    f"TỪ KHÓA TÌM KIẾM: {subject} {goal} | "
+                    f"Bài tập tự luyện: Thực hành 15 phút | "
+                    f"CÔNG CỤ HỖ TRỢ: Google Classroom"
+                )
+
+        # --- Save DB ---
         user = request.user
         try:
             with transaction.atomic():
-                # Delete old progress for this subject
                 deleted_count = ProgressLog.objects.filter(
-                    user=user, 
-                    subject=subject
+                    user=user, subject=subject
                 ).delete()[0]
-                logger.info(f"Deleted {deleted_count} old progress logs")
-                
-                # Create new progress logs
+                logger.info("Deleted %d old ProgressLog rows", deleted_count)
+
                 objs = []
                 for day_number in sorted(plan.keys()):
                     task_text = str(plan[day_number])
                     week = (day_number - 1) // 7 + 1
-                    objs.append(ProgressLog(
-                        user=user,
-                        subject=subject,
-                        week=week,
-                        day_number=day_number,
-                        task_title=task_text,
-                        status="pending",
-                    ))
-                
-                created_logs = ProgressLog.objects.bulk_create(objs)
-                logger.info(f"Created {len(created_logs)} new progress logs")
-        except Exception as db_error:
-            logger.error(f"Database error: {db_error}")
+                    objs.append(
+                        ProgressLog(
+                            user=user,
+                            subject=subject,
+                            week=week,
+                            day_number=day_number,
+                            task_title=task_text,
+                            status="pending",
+                        )
+                    )
+                ProgressLog.objects.bulk_create(objs)
+                logger.info("Created %d new ProgressLog rows", len(objs))
+        except Exception:
+            logger.exception("Database error on ProgressLog save")
             return Response(
-                {"error": "Lỗi lưu dữ liệu vào database"}, 
-                status=500
+                {"error": "Lỗi lưu dữ liệu vào database"},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
             )
-        
-        # Return success response
+
+        # --- Return ---
         logs = ProgressLog.objects.filter(
-            user=user, 
-            subject=subject
+            user=user, subject=subject
         ).order_by("week", "day_number")
-        
+
         return Response(
             {
                 "message": "✅ Đã tạo lộ trình học!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
-                "raw_gpt_output": gpt_text_vi[:1000],  # Limit output size
+                "raw_gpt_output": gpt_text_vi[:1000],
             },
-            status=201,
+            status=status.HTTP_201_CREATED,
         )
-        
+
     except Exception as unexpected_error:
-        logger.error(f"Unexpected error in generate_learning_path: {unexpected_error}")
-        logger.error(f"Error type: {type(unexpected_error).__name__}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        
+        logger.exception("Unexpected error in generate_learning_path")
         return Response(
             {
                 "error": "Lỗi không xác định",
-                "details": str(unexpected_error)[:200]
+                "details": str(unexpected_error)[:200],
             },
-            status=500
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
+
 
 # =========================================
 # Get progress list
@@ -276,13 +284,16 @@ def get_progress_list(request):
     try:
         subject = request.query_params.get("subject")
         user = request.user
-        qs = ProgressLog.objects.filter(user=user).order_by("subject", "week", "day_number")
+        qs = ProgressLog.objects.filter(user=user).order_by(
+            "subject", "week", "day_number"
+        )
         if subject:
             qs = qs.filter(subject=subject)
         return Response(ProgressLogSerializer(qs, many=True).data, status=200)
     except Exception as e:
-        logger.error(f"Error in get_progress_list: {e}")
+        logger.exception("Error in get_progress_list: %s", e)
         return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
+
 
 # =========================================
 # Update progress status
@@ -293,37 +304,34 @@ def update_progress_status(request):
     try:
         log_id = request.data.get("id")
         new_status_raw = request.data.get("status")
-        
+
         if not log_id or new_status_raw is None:
             return Response(
-                {"error": "Thiếu thông tin 'id' hoặc 'status'."}, 
-                status=400
+                {"error": "Thiếu thông tin 'id' hoặc 'status'."}, status=400
             )
-        
+
         try:
             log = ProgressLog.objects.get(id=log_id, user=request.user)
         except ProgressLog.DoesNotExist:
-            return Response(
-                {"error": "Không tìm thấy bản ghi của bạn"}, 
-                status=404
-            )
-        
+            return Response({"error": "Không tìm thấy bản ghi của bạn"}, status=404)
+
         log.status = normalize_status(new_status_raw)
         log.save(update_fields=["status"])
-        
+
         return Response(
             {
-                "message": "Cập nhật trạng thái thành công!", 
-                "item": ProgressLogSerializer(log).data
+                "message": "Cập nhật trạng thái thành công!",
+                "item": ProgressLogSerializer(log).data,
             },
             status=200,
         )
     except Exception as e:
-        logger.error(f"Error in update_progress_status: {e}")
+        logger.exception("Error in update_progress_status: %s", e)
         return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
 
+
 # =========================================
-# Auth & CSRF endpoints (không thay đổi)
+# Auth & CSRF endpoints
 # =========================================
 @api_view(["GET"])
 @ensure_csrf_cookie
@@ -338,11 +346,8 @@ def register(request):
     if serializer.is_valid():
         user = serializer.save()
         return Response(
-            {
-                "message": "Đăng ký thành công!", 
-                "user": UserSerializer(user).data
-            }, 
-            status=201
+            {"message": "Đăng ký thành công!", "user": UserSerializer(user).data},
+            status=201,
         )
     return Response(serializer.errors, status=400)
 
@@ -352,20 +357,12 @@ def login_view(request):
     username = request.data.get("username")
     password = request.data.get("password")
     user = authenticate(request, username=username, password=password)
-    
+
     if not user:
-        return Response(
-            {"detail": "Sai tên đăng nhập hoặc mật khẩu."}, 
-            status=400
-        )
-    
+        return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
+
     login(request, user)
-    return Response(
-        {
-            "message": "Đăng nhập thành công!", 
-            "username": user.username
-        }
-    )
+    return Response({"message": "Đăng nhập thành công!", "username": user.username})
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
