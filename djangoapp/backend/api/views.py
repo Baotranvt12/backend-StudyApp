@@ -127,8 +127,8 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
                 model="openchat/openchat_3.5",
                 messages=messages,
                 stream=False,
-                max_tokens=2000,  # Limit response length
-                temperature=0.7   # Add some creativity
+                max_tokens=1200,  
+                temperature=0.6   
             )
             logger.info("DeepInfra API call successful")
         except Exception as api_error:
