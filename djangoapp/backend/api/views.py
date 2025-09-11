@@ -1,7 +1,8 @@
 import os
 import re
 import logging
-import asyncio
+import time
+import random
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
@@ -11,7 +12,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 from django.views.decorators.csrf import ensure_csrf_cookie
-from openai import OpenAI
+from openai import OpenAI, RateLimitError, APIConnectionError, APIError
 from .models import ProgressLog
 from .serializers import (
     ProgressLogSerializer,
@@ -23,7 +24,7 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 # =========================
-# OpenAI (DeepInfra) client
+# OpenAI (DeepInfra) client với cấu hình từ test thành công
 # =========================
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
 
@@ -42,10 +43,11 @@ if not DEEPINFRA_API_KEY:
         raise ValueError("DEEPINFRA_API_KEY environment variable is required in production")
 
 try:
-    openai = OpenAI(
+    # Cấu hình giống test thành công trong Colab
+    openai_client = OpenAI(
         api_key=DEEPINFRA_API_KEY,
         base_url="https://api.deepinfra.com/v1/openai",
-        timeout=60.0,  # Set timeout cho OpenAI client
+        timeout=60.0,  # Giống Colab test
     )
     logger.info("OpenAI client initialized successfully")
 except Exception as e:
@@ -53,7 +55,7 @@ except Exception as e:
     raise
 
 # =========================
-# Helpers
+# Helpers với retry logic từ Colab test
 # =========================
 def normalize_status(value: str) -> str:
     """Normalize arbitrary status strings into 'pending' or 'done'."""
@@ -62,68 +64,125 @@ def normalize_status(value: str) -> str:
     v = value.strip().lower()
     return "done" if v == "done" else "pending"
 
-def call_deepinfra_api(messages, timeout=50):
+def call_with_backoff(messages, model="openchat/openchat_3.5", 
+                      max_tokens=1400, temperature=0.6, max_attempts=5):
     """
-    Helper function để gọi DeepInfra API với timeout
+    Function từ Colab test - đã hoạt động thành công
     """
-    try:
-        resp = openai.chat.completions.create(
-            model="openchat/openchat_3.5",
-            messages=messages,
-            stream=False,
-            max_tokens=1200,  
-            temperature=0.6,
-            timeout=timeout  # Timeout cho request cụ thể
-        )
-        return resp, None
-    except Exception as e:
-        logger.error(f"DeepInfra API error: {str(e)}")
-        return None, e
+    for attempt in range(1, max_attempts + 1):
+        try:
+            t0 = time.perf_counter()
+            resp = openai_client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=60.0,  # Timeout giống Colab test
+            )
+            elapsed = time.perf_counter() - t0
+            logger.info(f"✅ API call completed in {elapsed:.2f}s (attempt {attempt})")
+            return resp
+        except RateLimitError as e:
+            # Model busy/quota/rate limit → exponential backoff + jitter
+            sleep = min(60, 2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(f"⏳ Rate limit (attempt {attempt}) → retry in {sleep:.1f}s")
+            if attempt < max_attempts:
+                time.sleep(sleep)
+            else:
+                raise
+        except APIConnectionError as e:
+            sleep = min(20, 2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(f"🌐 Network issue (attempt {attempt}) → retry in {sleep:.1f}s")
+            if attempt < max_attempts:
+                time.sleep(sleep)
+            else:
+                raise
+        except APIError as e:
+            # 5xx service errors – retry 1-2 lần
+            if attempt >= max_attempts:
+                raise
+            sleep = min(20, 2 ** attempt) + random.uniform(0, 0.5)
+            logger.warning(f"🛠️ Service error (attempt {attempt}) → retry in {sleep:.1f}s")
+            time.sleep(sleep)
+    
+    raise RuntimeError("Failed after all retry attempts")
 
 def generate_fallback_plan(class_level, subject, study_time, goal):
     """
-    Tạo kế hoạch dự phòng khi API fails
+    Enhanced fallback plan cho từng môn học cụ thể
     """
-    logger.info("Generating fallback learning plan")
+    logger.info("Generating enhanced fallback learning plan")
     plan = {}
     
-    # Tạo kế hoạch cơ bản 28 ngày
-    topics = [
-        "Giới thiệu và làm quen cơ bản",
-        "Khái niệm và định nghĩa quan trọng", 
-        "Thực hành cơ bản",
-        "Ứng dụng thực tế",
-        "Ôn tập và củng cố"
-    ]
+    # Chủ đề chi tiết theo môn học
+    if "toán" in subject.lower():
+        topics = [
+            "Ôn tập kiến thức cơ bản và công thức quan trọng",
+            "Học định lý mới và cách chứng minh",
+            "Thực hành bài tập trắc nghiệm cơ bản", 
+            "Giải bài tập tự luận dạng cơ bản",
+            "Thực hành bài tập nâng cao và khó",
+            "Ôn tập chuyên sâu các dạng bài hay gặp",
+            "Kiểm tra và đánh giá kết quả học tập"
+        ]
+        tools = "GeoGebra, Photomath, Khan Academy, Wolfram Alpha"
+    elif "tin học" in subject.lower() or "công nghệ" in subject.lower():
+        topics = [
+            "Làm quen với ngôn ngữ lập trình cơ bản",
+            "Học cú pháp và cấu trúc dữ liệu", 
+            "Thực hành thuật toán sắp xếp và tìm kiếm",
+            "Lập trình giải quyết bài toán thực tế",
+            "Học về cơ sở dữ liệu và SQL",
+            "Thực hành project nhỏ và debugging",
+            "Tổng hợp kiến thức và làm đồ án"
+        ]
+        tools = "Visual Studio Code, Scratch, Python IDLE, GitHub"
+    elif "văn" in subject.lower():
+        topics = [
+            "Ôn tập lý thuyết văn học và tác giả",
+            "Đọc hiểu và phân tích văn bản",
+            "Luyện viết bài văn nghị luận",
+            "Thực hành làm bài thi trắc nghiệm",
+            "Viết bài văn tự luận theo đề cương",
+            "Ôn tập toàn bộ chương trình và đề thi",
+            "Kiểm tra và rút kinh nghiệm"
+        ]
+        tools = "Sách giáo khoa, Văn mẫu online, Quizlet"
+    else:
+        # Default cho các môn khác
+        topics = [
+            "Ôn tập kiến thức nền tảng cơ bản",
+            "Học lý thuyết mới theo chương trình",
+            "Thực hành bài tập áp dụng trực tiếp", 
+            "Giải bài tập vận dụng và tổng hợp",
+            "Ôn tập và làm đề thi thử",
+            "Tổng hợp kiến thức toàn chương trình",
+            "Đánh giá và hoàn thiện kiến thức"
+        ]
+        tools = "Google Classroom, YouTube, Khan Academy"
     
     for day in range(1, 29):
         if day == 28:
-            task = f"Ngày {day}: ÔN TẬP & KIỂM TRA TỔNG HỢP - {goal} | TỪ KHÓA TÌM KIẾM: {subject} ôn tập tổng hợp | Bài tập tự luyện: Làm bài kiểm tra tổng hợp 60 phút | CÔNG CỤ HỖ TRỢ: Google Forms, Kahoot"
+            task = f"Ngày {day}: ÔN TẬP & KIỂM TRA TỔNG HỢP - {goal} | TỪ KHÓA TÌM KIẾM: {subject} ôn tập tổng hợp lớp {class_level} thi cuối kỳ | Bài tập tự luyện: Làm đề thi thử hoàn chỉnh trong 120 phút | CÔNG CỤ HỖ TRỢ: {tools}, Google Forms"
         else:
             week = (day - 1) // 7 + 1
             topic_idx = (day - 1) % len(topics)
             topic = topics[topic_idx]
             
-            task = f"Ngày {day}: {topic} - {subject} liên quan đến {goal} | TỪ KHÓA TÌM KIẾM: {subject} {goal} ngày {day} | Bài tập tự luyện: Thực hành {study_time} với chủ đề {topic} | CÔNG CỤ HỖ TRỢ: Google Classroom, Khan Academy"
+            task = f"Ngày {day}: {topic} - {subject} lớp {class_level} | TỪ KHÓA TÌM KIẾM: {subject} lớp {class_level} {topic.lower()} | Bài tập tự luyện: Thực hành {study_time} với {topic.lower()} | CÔNG CỤ HỖ TRỢ: {tools}"
         
         plan[day] = task
     
     return plan
 
 # =========================================
-# Generate learning path (store per-user)
+# Generate learning path với timeout từ Colab test
 # =========================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
     """
-    Body JSON:
-    {
-      "class_level": "10",
-      "subject": "Tin học",
-      "study_time": "1 giờ",
-      "goal": "Nắm vững Python cơ bản"
-    }
+    Optimized version dựa trên test thành công trong Colab
     """
     try:
         # Log request data
@@ -143,83 +202,96 @@ def generate_learning_path(request):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Prompt
+        # Prompt giống như trong Colab test thành công
         messages = [
             {
-                "role": "system",
-                "content": (
-                    "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
-                ),
+                "role": "system", 
+                "content": "Bạn là chuyên gia lập kế hoạch tự học, trả lời 100% tiếng Việt."
             },
             {
-                "role": "user",
+                "role": "user", 
                 "content": f"""
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}. 
+Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}.
 Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 YÊU CẦU:
-- Xuất ra CHÍNH XÁC 28 dòng (tương ứng Ngày 1 → Ngày 28). 
-- Mỗi dòng là một hoạt động học ngắn gọn, theo tiến trình từ cơ bản đến nâng cao. 
-- Nội dung theo chương trình Giáo dục phổ thông 2018 của Bộ Giáo dục và Đào tạo. 
-- Ngày 28 phải là phần ÔN TẬP & KIỂM TRA TỔNG HỢP. 
-- KHÔNG in thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
-Định dạng MỖI DÒNG:
-Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số học tập liên quan đến môn {subject}>
-Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
-""",
-            },
+- Xuất ra CHÍNH XÁC 28 dòng (Ngày 1 → Ngày 28), mỗi dòng ≤ 120 ký tự, không dòng trống.
+- Nội dung theo CT GDPT 2018. Ngày 28 = ÔN TẬP & KIỂM TRA TỔNG HỢP.
+- KHÔNG tiêu đề, KHÔNG markdown, KHÔNG code block.
+Định dạng:
+Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý> | CÔNG CỤ HỖ TRỢ: <ứng dụng liên quan đến môn {subject}>
+Chỉ in đúng 28 dòng theo mẫu trên, không thêm gì khác.
+""".strip()
+            }
         ]
         
-        # Call LLM với timeout và ThreadPoolExecutor
-        logger.info("Calling DeepInfra API with timeout...")
+        # Gọi API với cấu hình từ Colab test
+        logger.info("Calling DeepInfra API with proven configuration...")
         
         plan = {}
         ai_success = False
+        api_response_time = 0
         
         try:
-            # Sử dụng ThreadPoolExecutor để có thể set timeout
+            # Sử dụng ThreadPoolExecutor với timeout lớn hơn
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(call_deepinfra_api, messages, 45)  # 45s timeout cho API call
+                start_time = time.time()
+                # Tăng timeout để phù hợp với Colab test (60s + buffer)
+                future = executor.submit(
+                    call_with_backoff, 
+                    messages, 
+                    model="openchat/openchat_3.5",
+                    max_tokens=1400, 
+                    temperature=0.6
+                )
                 
                 try:
-                    resp, api_error = future.result(timeout=50)  # 50s timeout cho toàn bộ operation
-                    
-                    if api_error:
-                        raise api_error
+                    # Timeout 90s cho toàn bộ operation (bao gồm retry)
+                    resp = future.result(timeout=90)  
+                    api_response_time = time.time() - start_time
                     
                     if resp:
-                        logger.info("DeepInfra API call successful")
+                        logger.info(f"API call successful in {api_response_time:.2f}s")
                         
-                        # Parse response
-                        gpt_text_vi = (resp.choices[0].message.content or "").strip()
-                        logger.info(f"GPT response length: {len(gpt_text_vi)}")
+                        # Parse response giống Colab
+                        text = (resp.choices[0].message.content or "").strip()
+                        logger.info(f"GPT response length: {len(text)}")
                         
-                        if gpt_text_vi:
-                            # Parse "Ngày N: ..." lines
-                            line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
-                            for raw_line in gpt_text_vi.splitlines():
-                                line = raw_line.strip()
-                                if not line:
-                                    continue
-                                m = line_regex.match(line)
-                                if not m:
-                                    continue
+                        if text:
+                            # Parse lines
+                            lines = [ln for ln in text.splitlines() if ln.strip()]
+                            valid_lines = [ln for ln in lines if re.match(r"^Ngày\s+(\d{1,2})\s*[:\-–].+", ln)]
+                            
+                            logger.info(f"Lines: total={len(lines)}, valid='Ngày N'={len(valid_lines)}")
+                            
+                            # Parse days
+                            for line in valid_lines:
                                 try:
-                                    day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
-                                except Exception:
+                                    day_match = re.search(r"Ngày\s+(\d{1,2})", line)
+                                    if day_match:
+                                        day_num = int(day_match.group(1))
+                                        if 1 <= day_num <= 28:
+                                            plan[day_num] = line
+                                except Exception as e:
+                                    logger.warning(f"Error parsing line: {line[:50]}... - {e}")
                                     continue
-                                if 1 <= day_num <= 28:
-                                    plan[day_num] = line
                             
-                            logger.info(f"Parsed {len(plan)} days from GPT response")
+                            logger.info(f"Successfully parsed {len(plan)} days from GPT response")
                             
-                            # Check if we got all 28 days
-                            if len(plan) == 28:
+                            # Check success threshold
+                            if len(plan) >= 20:  # Accept if we got at least 20 days
                                 ai_success = True
+                                # Fill missing days with fallback
+                                if len(plan) < 28:
+                                    logger.info(f"Filling {28 - len(plan)} missing days with fallback")
+                                    fallback_plan = generate_fallback_plan(class_level, subject, study_time, goal)
+                                    for day in range(1, 29):
+                                        if day not in plan:
+                                            plan[day] = fallback_plan[day]
                             else:
-                                logger.warning(f"Expected 28 days but got {len(plan)}. Will use fallback.")
+                                logger.warning(f"Only got {len(plan)} days, using full fallback")
                         
                 except FutureTimeoutError:
-                    logger.error("API call timed out after 50 seconds")
+                    logger.error("API call timed out after 90 seconds")
                     future.cancel()
                     
         except Exception as e:
@@ -227,21 +299,19 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
         
         # Nếu AI không thành công, dùng fallback plan
         if not ai_success:
-            logger.info("Using fallback plan due to AI failure or timeout")
+            logger.info(f"Using fallback plan (API response time: {api_response_time:.2f}s)")
             plan = generate_fallback_plan(class_level, subject, study_time, goal)
         
-        # Save to DB (per user & subject)
+        # Save to DB
         user = request.user
         try:
             with transaction.atomic():
-                # Delete old progress for this subject
                 deleted_count = ProgressLog.objects.filter(
                     user=user, 
                     subject=subject
                 ).delete()[0]
                 logger.info(f"Deleted {deleted_count} old progress logs")
                 
-                # Create new progress logs
                 objs = []
                 for day_number in sorted(plan.keys()):
                     task_text = str(plan[day_number])
@@ -274,18 +344,14 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
             "message": "✅ Đã tạo lộ trình học!",
             "subject": subject,
             "items": ProgressLogSerializer(logs, many=True).data,
-            "ai_generated": ai_success,  # Cho biết có dùng AI hay fallback
+            "ai_generated": ai_success,
+            "response_time": f"{api_response_time:.2f}s" if api_response_time > 0 else "fallback",
         }
-        
-        # Only include raw output if AI was successful
-        if ai_success and 'gpt_text_vi' in locals():
-            response_data["raw_gpt_output"] = gpt_text_vi[:1000]
         
         return Response(response_data, status=201)
         
     except Exception as unexpected_error:
         logger.error(f"Unexpected error in generate_learning_path: {unexpected_error}")
-        logger.error(f"Error type: {type(unexpected_error).__name__}")
         import traceback
         logger.error(f"Traceback: {traceback.format_exc()}")
         
@@ -298,7 +364,7 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
         )
 
 # =========================================
-# Get progress list
+# Các endpoints khác giữ nguyên
 # =========================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
@@ -314,9 +380,6 @@ def get_progress_list(request):
         logger.error(f"Error in get_progress_list: {e}")
         return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
 
-# =========================================
-# Update progress status
-# =========================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_progress_status(request):
@@ -352,9 +415,7 @@ def update_progress_status(request):
         logger.error(f"Error in update_progress_status: {e}")
         return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
 
-# =========================================
-# Auth & CSRF endpoints (không thay đổi)
-# =========================================
+# Auth endpoints
 @api_view(["GET"])
 @ensure_csrf_cookie
 @permission_classes([AllowAny])
