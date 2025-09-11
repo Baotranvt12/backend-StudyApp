@@ -1,6 +1,8 @@
 import os
 import re
 import logging
+import asyncio
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
@@ -33,8 +35,6 @@ if DEEPINFRA_API_KEY:
 
 if not DEEPINFRA_API_KEY:
     logger.error("DEEPINFRA_API_KEY environment variable is not set!")
-    # Trong development, có thể dùng một key mặc định
-    # Nhưng trong production PHẢI raise error
     if os.environ.get("DJANGO_DEBUG", "false").lower() == "true":
         logger.warning("Using default API key for development only!")
         DEEPINFRA_API_KEY = "your_development_key_here"
@@ -45,6 +45,7 @@ try:
     openai = OpenAI(
         api_key=DEEPINFRA_API_KEY,
         base_url="https://api.deepinfra.com/v1/openai",
+        timeout=60.0,  # Set timeout cho OpenAI client
     )
     logger.info("OpenAI client initialized successfully")
 except Exception as e:
@@ -60,6 +61,54 @@ def normalize_status(value: str) -> str:
         return "pending"
     v = value.strip().lower()
     return "done" if v == "done" else "pending"
+
+def call_deepinfra_api(messages, timeout=50):
+    """
+    Helper function để gọi DeepInfra API với timeout
+    """
+    try:
+        resp = openai.chat.completions.create(
+            model="openchat/openchat_3.5",
+            messages=messages,
+            stream=False,
+            max_tokens=1200,  
+            temperature=0.6,
+            timeout=timeout  # Timeout cho request cụ thể
+        )
+        return resp, None
+    except Exception as e:
+        logger.error(f"DeepInfra API error: {str(e)}")
+        return None, e
+
+def generate_fallback_plan(class_level, subject, study_time, goal):
+    """
+    Tạo kế hoạch dự phòng khi API fails
+    """
+    logger.info("Generating fallback learning plan")
+    plan = {}
+    
+    # Tạo kế hoạch cơ bản 28 ngày
+    topics = [
+        "Giới thiệu và làm quen cơ bản",
+        "Khái niệm và định nghĩa quan trọng", 
+        "Thực hành cơ bản",
+        "Ứng dụng thực tế",
+        "Ôn tập và củng cố"
+    ]
+    
+    for day in range(1, 29):
+        if day == 28:
+            task = f"Ngày {day}: ÔN TẬP & KIỂM TRA TỔNG HỢP - {goal} | TỪ KHÓA TÌM KIẾM: {subject} ôn tập tổng hợp | Bài tập tự luyện: Làm bài kiểm tra tổng hợp 60 phút | CÔNG CỤ HỖ TRỢ: Google Forms, Kahoot"
+        else:
+            week = (day - 1) // 7 + 1
+            topic_idx = (day - 1) % len(topics)
+            topic = topics[topic_idx]
+            
+            task = f"Ngày {day}: {topic} - {subject} liên quan đến {goal} | TỪ KHÓA TÌM KIẾM: {subject} {goal} ngày {day} | Bài tập tự luyện: Thực hành {study_time} với chủ đề {topic} | CÔNG CỤ HỖ TRỢ: Google Classroom, Khan Academy"
+        
+        plan[day] = task
+    
+    return plan
 
 # =========================================
 # Generate learning path (store per-user)
@@ -96,15 +145,15 @@ def generate_learning_path(request):
         
         # Prompt
         messages = [
-    {
-        "role": "system",
-        "content": (
-            "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
-        ),
-    },
-    {
-        "role": "user",
-        "content": f"""
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
 Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}. 
 Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 YÊU CẦU:
@@ -117,92 +166,70 @@ YÊU CẦU:
 Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số học tập liên quan đến môn {subject}>
 Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
 """,
-    },
-]
+            },
+        ]
         
-        # Call LLM with better error handling
-        logger.info("Calling DeepInfra API...")
-        try:
-            resp = openai.chat.completions.create(
-                model="openchat/openchat_3.5",
-                messages=messages,
-                stream=False,
-                max_tokens=1200,  
-                temperature=0.6   
-            )
-            logger.info("DeepInfra API call successful")
-        except Exception as api_error:
-            logger.error(f"DeepInfra API error: {str(api_error)}")
-            logger.error(f"Error type: {type(api_error).__name__}")
-            
-            # Check specific error types
-            error_message = str(api_error)
-            if "api_key" in error_message.lower():
-                return Response(
-                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."}, 
-                    status=500
-                )
-            elif "rate" in error_message.lower():
-                return Response(
-                    {"error": "Đã vượt quá giới hạn API. Vui lòng thử lại sau."}, 
-                    status=429
-                )
-            else:
-                return Response(
-                    {
-                        "error": "Lỗi khi gọi AI service",
-                        "details": str(api_error)[:200]  # Limit error message length
-                    }, 
-                    status=500
-                )
+        # Call LLM với timeout và ThreadPoolExecutor
+        logger.info("Calling DeepInfra API with timeout...")
         
-        # Parse response
-        try:
-            gpt_text_vi = (resp.choices[0].message.content or "").strip()
-            logger.info(f"GPT response length: {len(gpt_text_vi)}")
-            
-            if not gpt_text_vi:
-                logger.error("Empty response from GPT")
-                return Response(
-                    {"error": "Không nhận được phản hồi từ AI"}, 
-                    status=500
-                )
-        except Exception as parse_error:
-            logger.error(f"Error parsing GPT response: {parse_error}")
-            return Response(
-                {"error": "Lỗi xử lý phản hồi từ AI"}, 
-                status=500
-            )
-        
-        # === Parse "Ngày N: ..." lines ===
-        line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
         plan = {}
-
-        for raw_line in gpt_text_vi.splitlines():
-            line = raw_line.strip()
-            if not line:
-                continue
-            m = line_regex.match(line)
-            if not m:
-                continue
-            try:
-                day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
-            except Exception:
-                continue
-            if 1 <= day_num <= 28:
-                # Giữ toàn bộ dòng
-                plan[day_num] = line
-
-        logger.info(f"Parsed {len(plan)} days from GPT response")
-
-        # Validate đủ 28 ngày
-        if len(plan) != 28:
-            logger.warning(f"Expected 28 days but got {len(plan)}. Fallback to default plan.")
-            plan = {}
-            for day in range(1, 29):
-                week = (day - 1) // 7 + 1
-                plan[day] = f"Ngày {day}: Học {subject} - Ôn tập/chủ đề liên quan {goal} | TỪ KHÓA TÌM KIẾM: {subject} {goal} | Bài tập tự luyện: Thực hành 15 phút | CÔNG CỤ HỖ TRỢ: Google Classroom"
-       
+        ai_success = False
+        
+        try:
+            # Sử dụng ThreadPoolExecutor để có thể set timeout
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(call_deepinfra_api, messages, 45)  # 45s timeout cho API call
+                
+                try:
+                    resp, api_error = future.result(timeout=50)  # 50s timeout cho toàn bộ operation
+                    
+                    if api_error:
+                        raise api_error
+                    
+                    if resp:
+                        logger.info("DeepInfra API call successful")
+                        
+                        # Parse response
+                        gpt_text_vi = (resp.choices[0].message.content or "").strip()
+                        logger.info(f"GPT response length: {len(gpt_text_vi)}")
+                        
+                        if gpt_text_vi:
+                            # Parse "Ngày N: ..." lines
+                            line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
+                            for raw_line in gpt_text_vi.splitlines():
+                                line = raw_line.strip()
+                                if not line:
+                                    continue
+                                m = line_regex.match(line)
+                                if not m:
+                                    continue
+                                try:
+                                    day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
+                                except Exception:
+                                    continue
+                                if 1 <= day_num <= 28:
+                                    plan[day_num] = line
+                            
+                            logger.info(f"Parsed {len(plan)} days from GPT response")
+                            
+                            # Check if we got all 28 days
+                            if len(plan) == 28:
+                                ai_success = True
+                            else:
+                                logger.warning(f"Expected 28 days but got {len(plan)}. Will use fallback.")
+                        
+                except FutureTimeoutError:
+                    logger.error("API call timed out after 50 seconds")
+                    future.cancel()
+                    
+        except Exception as e:
+            logger.error(f"Error during API call: {str(e)}")
+        
+        # Nếu AI không thành công, dùng fallback plan
+        if not ai_success:
+            logger.info("Using fallback plan due to AI failure or timeout")
+            plan = generate_fallback_plan(class_level, subject, study_time, goal)
+        
         # Save to DB (per user & subject)
         user = request.user
         try:
@@ -243,15 +270,18 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
             subject=subject
         ).order_by("week", "day_number")
         
-        return Response(
-            {
-                "message": "✅ Đã tạo lộ trình học!",
-                "subject": subject,
-                "items": ProgressLogSerializer(logs, many=True).data,
-                "raw_gpt_output": gpt_text_vi[:1000],  # Limit output size
-            },
-            status=201,
-        )
+        response_data = {
+            "message": "✅ Đã tạo lộ trình học!",
+            "subject": subject,
+            "items": ProgressLogSerializer(logs, many=True).data,
+            "ai_generated": ai_success,  # Cho biết có dùng AI hay fallback
+        }
+        
+        # Only include raw output if AI was successful
+        if ai_success and 'gpt_text_vi' in locals():
+            response_data["raw_gpt_output"] = gpt_text_vi[:1000]
+        
+        return Response(response_data, status=201)
         
     except Exception as unexpected_error:
         logger.error(f"Unexpected error in generate_learning_path: {unexpected_error}")
