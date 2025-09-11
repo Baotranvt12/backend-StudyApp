@@ -50,7 +50,6 @@ else:
 # ========= CORS Configuration =========
 CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
-    "http://localhost:3001",
     NETLIFY_URL,
 ]
 
@@ -73,10 +72,18 @@ CORS_ALLOW_HEADERS = [
     "x-requested-with",
 ]
 
+CORS_ALLOW_METHODS = [
+    'DELETE',
+    'GET',
+    'OPTIONS',
+    'PATCH',
+    'POST',
+    'PUT',
+]
+
 # ========= CSRF Configuration =========
 CSRF_TRUSTED_ORIGINS = [
     "http://localhost:3000",
-    "http://localhost:3001",
     "https://backend-studyapp-production.up.railway.app",
     NETLIFY_URL,
 ]
@@ -88,12 +95,16 @@ if CUSTOM_DOMAIN:
 if RAILWAY_URL:
     CSRF_TRUSTED_ORIGINS.append(f"https://{RAILWAY_URL}")
 
-# Cookie configuration for cross-origin
-SESSION_COOKIE_SAMESITE = "None"
-CSRF_COOKIE_SAMESITE = "None"
-SESSION_COOKIE_SECURE = True
-CSRF_COOKIE_SECURE = True
-CSRF_COOKIE_HTTPONLY = False  # Allow JavaScript to read CSRF token
+# Session Configuration
+SESSION_COOKIE_SECURE = True  # HTTPS only
+SESSION_COOKIE_HTTPONLY = True
+SESSION_COOKIE_SAMESITE = 'None'  # Quan trọng cho cross-origin
+
+# CSRF Configuration
+CSRF_COOKIE_SECURE = True  # HTTPS only
+CSRF_COOKIE_HTTPONLY = False  # Frontend cần đọc được
+CSRF_COOKIE_SAMESITE = 'None'  # Quan trọng cho cross-origin
+
 
 # ========= Installed Apps =========
 INSTALLED_APPS = [
@@ -202,22 +213,27 @@ if not DEBUG:
 
 # ========= Logging Configuration =========
 LOGGING = {
-    "version": 1,
-    "disable_existing_loggers": False,
-    "handlers": {
-        "console": {
-            "class": "logging.StreamHandler",
+    'version': 1,
+    'disable_existing_loggers': False,
+    'handlers': {
+        'console': {
+            'class': 'logging.StreamHandler',
         },
     },
-    "root": {
-        "handlers": ["console"],
-        "level": "INFO" if not DEBUG else "DEBUG",
+    'root': {
+        'handlers': ['console'],
+        'level': 'INFO',
     },
-    "loggers": {
-        "django": {
-            "handlers": ["console"],
-            "level": "INFO",
-            "propagate": False,
+    'loggers': {
+        'django': {
+            'handlers': ['console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'corsheaders': {
+            'handlers': ['console'],
+            'level': 'DEBUG',
+            'propagate': False,
         },
     },
 }
