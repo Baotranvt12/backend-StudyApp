@@ -3,51 +3,102 @@ import re
 import time
 import random
 import logging
+from functools import lru_cache
+from typing import Dict, List
 
-from openai import OpenAI, RateLimitError, APIConnectionError, APIError
+from django.db import transaction
+from django.contrib.auth import authenticate, login, logout
+from django.contrib.auth.models import User
+from django.views.decorators.csrf import ensure_csrf_cookie
 
-logger = logging.getLogger(__name__)
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.response import Response
+from rest_framework import status
 
-# -- OpenAI (DeepInfra) client --
-DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
-if not DEEPINFRA_API_KEY:
-    raise RuntimeError("DEEPINFRA_API_KEY is required")
+from openai import OpenAI, RateLimitError, APIConnectionError, APIError, AuthenticationError
 
-openai_client = OpenAI(
-    api_key=DEEPINFRA_API_KEY,
-    base_url="https://api.deepinfra.com/v1/openai",
-    timeout=60.0,  # tổng timeout mặc định của client
+from .models import ProgressLog
+from .serializers import (
+    ProgressLogSerializer,
+    RegisterSerializer,
+    UserSerializer,
 )
 
-# -- Regex “siết chặt” định dạng mỗi dòng (chấp nhận :, ：, -, –, —) --
+# =====================================================
+# Logging
+# =====================================================
+logger = logging.getLogger(__name__)
+
+# =====================================================
+# OpenAI (DeepInfra) client - lazy init + cache
+# =====================================================
+@lru_cache(maxsize=1)
+def get_openai_client() -> OpenAI:
+    api_key = os.environ.get("DEEPINFRA_API_KEY")
+    if not api_key:
+        raise RuntimeError("DEEPINFRA_API_KEY is required")
+    client = OpenAI(
+        api_key=api_key,
+        base_url="https://api.deepinfra.com/v1/openai",
+        timeout=60.0,  # tổng timeout mặc định ở client
+    )
+    return client
+
+# =====================================================
+# Helpers
+# =====================================================
+def normalize_status(value: str) -> str:
+    """Normalize arbitrary status strings into 'pending' or 'done'."""
+    if not value:
+        return "pending"
+    v = value.strip().lower()
+    return "done" if v == "done" else "pending"
+
+
+# Regex siết chặt: BẮT BUỘC 'Ngày N:' (chấp nhận :, ：, -, –, — sau chữ số)
 LINE_REGEX = re.compile(r"^Ngày\s+(\d{1,2})\s*[:：\-–—]\s*(.+)$", re.IGNORECASE)
 
 
 def call_with_backoff(
-    messages,
+    messages: List[Dict],
     *,
-    model="openchat/openchat_3.5",
-    max_tokens=1400,
-    temperature=0.6,
-    timeout=55.0,          # < gunicorn timeout
-    max_attempts=5,
-    stop=None,
+    model: str = "openchat/openchat_3.5",
+    max_tokens: int = 1400,
+    temperature: float = 0.6,
+    timeout: float = 55.0,      # < gunicorn timeout (khuyến nghị ~120s)
+    max_attempts: int = 5,
+    stop: List[str] | None = None,
 ):
-    """Gọi LLM với retry + backoff; timeout ngắn hơn gunicorn để chủ động trả lỗi."""
+    """
+    Gọi LLM với retry + exponential backoff + jitter.
+    Luôn đặt timeout < timeout của Gunicorn để chủ động trả lỗi thay vì bị worker kill.
+    """
+    client = get_openai_client()
     for attempt in range(1, max_attempts + 1):
         try:
             t0 = time.perf_counter()
-            kwargs = dict(model=model, messages=messages, max_tokens=max_tokens,
-                          temperature=temperature, timeout=timeout)
+            kwargs = dict(
+                model=model,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                timeout=timeout,
+            )
             if stop:
                 kwargs["stop"] = stop
-            resp = openai_client.chat.completions.create(**kwargs)
-            logger.info("✅ API call in %.2fs (attempt %d)", time.perf_counter() - t0, attempt)
+            resp = client.chat.completions.create(**kwargs)
+            logger.info("✅ LLM call in %.2fs (attempt %d)", time.perf_counter() - t0, attempt)
             return resp
+
+        except AuthenticationError as e:
+            # Sai key → không retry
+            logger.error("Auth error: %s", e)
+            raise
 
         except RateLimitError:
             sleep = min(60, 2 ** attempt) + random.uniform(0, 0.5)
-            logger.warning("⏳ 429 Model busy (attempt %d) → retry in %.1fs", attempt, sleep)
+            logger.warning("⏳ 429 Model busy/quota (attempt %d) → retry in %.1fs", attempt, sleep)
             if attempt < max_attempts:
                 time.sleep(sleep)
             else:
@@ -72,8 +123,10 @@ def call_with_backoff(
     raise RuntimeError("LLM call failed after retries")
 
 
-def parse_plan_lines(text: str, plan: dict[int, str]) -> None:
-    """Thêm các dòng hợp lệ vào plan (không ghi đè ngày đã có)."""
+def parse_plan_lines(text: str, plan: Dict[int, str]) -> None:
+    """
+    Thêm các dòng hợp lệ vào plan (KHÔNG ghi đè ngày đã có).
+    """
     if not text:
         return
     for raw in text.splitlines():
@@ -91,8 +144,10 @@ def parse_plan_lines(text: str, plan: dict[int, str]) -> None:
             plan[day_num] = line
 
 
-def make_main_messages(class_level, subject, study_time, goal):
-    """Prompt chính: ép đầu dòng 'Ngày N:' + ≤120 ký tự + không dòng trống."""
+def make_main_messages(class_level: str, subject: str, study_time: str, goal: str) -> List[Dict]:
+    """
+    Prompt chính: ép định dạng 'Ngày N:' + ≤120 ký tự + không dòng trống.
+    """
     return [
         {
             "role": "system",
@@ -115,8 +170,10 @@ Chỉ in đúng 28 dòng theo mẫu, không thêm gì khác.
     ]
 
 
-def make_continue_messages(missing_days: list[int], subject: str):
-    """Prompt tiếp tục: chỉ in đúng các ngày còn thiếu."""
+def make_continue_messages(missing_days: List[int], subject: str) -> List[Dict]:
+    """
+    Prompt tiếp tục: chỉ in CHÍNH XÁC các ngày còn thiếu (không in ngày khác).
+    """
     days_str = ", ".join(str(d) for d in missing_days)
     count = len(missing_days)
     return [
@@ -135,9 +192,12 @@ Chỉ in đúng {count} dòng theo mẫu trên, không thêm gì khác.
     ]
 
 
-def generate_fallback_plan(class_level, subject, study_time, goal):
-    """Fallback chỉ fill phần THIẾU (giữ các ngày AI đã sinh)."""
-    plan = {}
+def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal: str) -> Dict[int, str]:
+    """
+    Fallback MINIMAL: chỉ dùng để fill phần THIẾU (giữ nguyên ngày đã sinh được).
+    Bạn có thể thay bằng fallback chi tiết hơn của bạn nếu muốn.
+    """
+    plan: Dict[int, str] = {}
     tools = "Google Classroom, YouTube, Khan Academy"
     for day in range(1, 29):
         if day == 28:
@@ -152,21 +212,25 @@ def generate_fallback_plan(class_level, subject, study_time, goal):
     return plan
 
 
-# ==== REPLACE VIEW: generate_learning_path ====
-from django.db import transaction
-from rest_framework.decorators import api_view, permission_classes
-from rest_framework.permissions import IsAuthenticated
-from rest_framework.response import Response
-from rest_framework import status
-from .models import ProgressLog
-from .serializers import ProgressLogSerializer
-
+# =====================================================
+# Generate learning path
+# =====================================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
+    """
+    Body JSON:
+    {
+      "class_level": "10",
+      "subject": "Tin học",
+      "study_time": "1 giờ",
+      "goal": "Nắm vững Python cơ bản"
+    }
+    """
     try:
         user = request.user
         data = request.data
+
         class_level = (data.get("class_level") or "").strip()
         subject     = (data.get("subject") or "").strip()
         study_time  = (data.get("study_time") or "").strip()
@@ -178,7 +242,8 @@ def generate_learning_path(request):
         # 1) Gọi lần 1: yêu cầu đủ 28 dòng, định dạng chặt
         messages = make_main_messages(class_level, subject, study_time, goal)
         logger.info("Calling DeepInfra (main 28 lines)...")
-        plan: dict[int, str] = {}
+
+        plan: Dict[int, str] = {}
         ai_used = False
 
         resp = call_with_backoff(messages, max_tokens=1400, temperature=0.6, timeout=55.0)
@@ -207,7 +272,7 @@ def generate_learning_path(request):
             for d in range(1, 29):
                 if d not in plan:
                     plan[d] = fb[d]
-            logger.info("Filled missing with fallback → %d/28 days", len(plan))
+            logger.info("Filled missing days with fallback → %d/28 days", len(plan))
 
         # 4) Lưu DB (xóa cũ theo môn của user, tạo mới)
         with transaction.atomic():
@@ -217,20 +282,29 @@ def generate_learning_path(request):
                 task_text = plan[day]
                 week = (day - 1) // 7 + 1
                 objs.append(ProgressLog(
-                    user=user, subject=subject, week=week,
-                    day_number=day, task_title=task_text, status="pending"
+                    user=user,
+                    subject=subject,
+                    week=week,
+                    day_number=day,
+                    task_title=task_text,
+                    status="pending",
                 ))
             ProgressLog.objects.bulk_create(objs)
 
         logs = ProgressLog.objects.filter(user=user, subject=subject).order_by("week", "day_number")
-        return Response({
-            "message": "✅ Đã tạo lộ trình học!",
-            "subject": subject,
-            "items": ProgressLogSerializer(logs, many=True).data,
-            "ai_generated": ai_used,
-            "note": "Đã siết định dạng & chỉ fill phần thiếu (không full fallback).",
-        }, status=201)
+        return Response(
+            {
+                "message": "✅ Đã tạo lộ trình học!",
+                "subject": subject,
+                "items": ProgressLogSerializer(logs, many=True).data,
+                "ai_generated": ai_used,
+                "note": "Siết định dạng & chỉ bổ sung phần thiếu (không full fallback).",
+            },
+            status=201,
+        )
 
+    except AuthenticationError:
+        return Response({"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."}, status=401)
     except RateLimitError:
         return Response({"error": "Đã vượt quá giới hạn AI. Vui lòng thử lại sau."}, status=429)
     except APIConnectionError:
@@ -238,6 +312,105 @@ def generate_learning_path(request):
     except APIError as e:
         return Response({"error": "AI service gặp sự cố.", "details": str(e)[:200]}, status=502)
     except Exception as e:
-        logger.exception("generate_learning_path failed")
-        return Response({"error": "Lỗi khi tạo lộ trình", "details": str(e)[:200]}, status=500)
+        logger.exception("Unexpected error in generate_learning_path")
+        return Response({"error": "Lỗi không xác định", "details": str(e)[:200]}, status=500)
 
+
+# =====================================================
+# Get progress list
+# =====================================================
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def get_progress_list(request):
+    try:
+        subject = request.query_params.get("subject")
+        user = request.user
+        qs = ProgressLog.objects.filter(user=user).order_by("subject", "week", "day_number")
+        if subject:
+            qs = qs.filter(subject=subject)
+        return Response(ProgressLogSerializer(qs, many=True).data, status=200)
+    except Exception as e:
+        logger.exception("Error in get_progress_list: %s", e)
+        return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
+
+
+# =====================================================
+# Update progress status
+# =====================================================
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def update_progress_status(request):
+    try:
+        log_id = request.data.get("id")
+        new_status_raw = request.data.get("status")
+
+        if not log_id or new_status_raw is None:
+            return Response({"error": "Thiếu thông tin 'id' hoặc 'status'."}, status=400)
+
+        try:
+            log = ProgressLog.objects.get(id=log_id, user=request.user)
+        except ProgressLog.DoesNotExist:
+            return Response({"error": "Không tìm thấy bản ghi của bạn"}, status=404)
+
+        log.status = normalize_status(new_status_raw)
+        log.save(update_fields=["status"])
+
+        return Response(
+            {"message": "Cập nhật trạng thái thành công!", "item": ProgressLogSerializer(log).data},
+            status=200,
+        )
+    except Exception as e:
+        logger.exception("Error in update_progress_status: %s", e)
+        return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
+
+
+# =====================================================
+# Auth & CSRF endpoints
+# =====================================================
+@api_view(["GET"])
+@ensure_csrf_cookie
+@permission_classes([AllowAny])
+def get_csrf(request):
+    return Response({"csrfToken": request.META.get("CSRF_COOKIE", "")})
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def register(request):
+    serializer = RegisterSerializer(data=request.data)
+    if serializer.is_valid():
+        user = serializer.save()
+        return Response(
+            {"message": "Đăng ký thành công!", "user": UserSerializer(user).data},
+            status=201,
+        )
+    return Response(serializer.errors, status=400)
+
+
+@api_view(["POST"])
+@permission_classes([AllowAny])
+def login_view(request):
+    username = request.data.get("username")
+    password = request.data.get("password")
+    user = authenticate(request, username=username, password=password)
+
+    if not user:
+        return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
+
+    login(request, user)
+    return Response({"message": "Đăng nhập thành công!", "username": user.username})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def logout_view(request):
+    logout(request)
+    return Response({"message": "Đã đăng xuất."})
+
+
+@api_view(["GET"])
+@permission_classes([AllowAny])
+def whoami(request):
+    if request.user.is_authenticated:
+        return Response({"username": request.user.username})
+    return Response({"username": None}, status=200)
