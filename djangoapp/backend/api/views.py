@@ -1,3 +1,4 @@
+# api/views.py
 import os
 import re
 import time
@@ -16,7 +17,13 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from openai import OpenAI, RateLimitError, APIConnectionError, APIError, AuthenticationError
+from openai import (
+    OpenAI,
+    RateLimitError,
+    APIConnectionError,
+    APIError,
+    AuthenticationError,
+)
 
 from .models import ProgressLog
 from .serializers import (
@@ -41,9 +48,10 @@ def get_openai_client() -> OpenAI:
     client = OpenAI(
         api_key=api_key,
         base_url="https://api.deepinfra.com/v1/openai",
-        timeout=60.0,  # tổng timeout mặc định ở client
+        timeout=60.0,  # client-level timeout (một lần gọi)
     )
     return client
+
 
 # =====================================================
 # Helpers
@@ -66,16 +74,28 @@ def call_with_backoff(
     model: str = "openchat/openchat_3.5",
     max_tokens: int = 1400,
     temperature: float = 0.6,
-    timeout: float = 55.0,      # < gunicorn timeout (khuyến nghị ~120s)
+    # Tổng hạn mức cho cả hàm (retry + sleep + các lần gọi)
+    overall_deadline: float = 55.0,     # < gunicorn timeout (ví dụ 120s)
+    per_attempt_timeout: float = 25.0,  # timeout cho MỖI lần gọi
     max_attempts: int = 5,
     stop: List[str] | None = None,
 ):
     """
-    Gọi LLM với retry + exponential backoff + jitter.
-    Luôn đặt timeout < timeout của Gunicorn để chủ động trả lỗi thay vì bị worker kill.
+    Gọi LLM với retry + exponential backoff + jitter và tôn trọng overall deadline.
+    Nếu hết thời gian tổng, raise TimeoutError để view chủ động trả 504.
     """
     client = get_openai_client()
+    start = time.perf_counter()
+
     for attempt in range(1, max_attempts + 1):
+        elapsed = time.perf_counter() - start
+        remain = overall_deadline - elapsed
+        if remain <= 0:
+            raise TimeoutError("Overall LLM deadline exceeded")
+
+        # timeout của lần gọi này không vượt quá tổng thời gian còn lại
+        per_timeout = max(5.0, min(per_attempt_timeout, remain - 1.0))
+
         try:
             t0 = time.perf_counter()
             kwargs = dict(
@@ -83,7 +103,7 @@ def call_with_backoff(
                 messages=messages,
                 max_tokens=max_tokens,
                 temperature=temperature,
-                timeout=timeout,
+                timeout=per_timeout,
             )
             if stop:
                 kwargs["stop"] = stop
@@ -92,35 +112,31 @@ def call_with_backoff(
             return resp
 
         except AuthenticationError as e:
-            # Sai key → không retry
             logger.error("Auth error: %s", e)
             raise
 
         except RateLimitError:
             sleep = min(60, 2 ** attempt) + random.uniform(0, 0.5)
-            logger.warning("⏳ 429 Model busy/quota (attempt %d) → retry in %.1fs", attempt, sleep)
-            if attempt < max_attempts:
-                time.sleep(sleep)
-            else:
-                raise
+            if (time.perf_counter() - start) + sleep >= overall_deadline:
+                raise TimeoutError("Deadline would be exceeded during backoff sleep")
+            logger.warning("⏳ 429 (attempt %d) → retry in %.1fs", attempt, sleep)
+            time.sleep(sleep)
 
         except APIConnectionError:
             sleep = min(20, 2 ** attempt) + random.uniform(0, 0.5)
-            logger.warning("🌐 Network issue (attempt %d) → retry in %.1fs", attempt, sleep)
-            if attempt < max_attempts:
-                time.sleep(sleep)
-            else:
-                raise
+            if (time.perf_counter() - start) + sleep >= overall_deadline:
+                raise TimeoutError("Deadline would be exceeded during backoff sleep")
+            logger.warning("🌐 Network (attempt %d) → retry in %.1fs", attempt, sleep)
+            time.sleep(sleep)
 
         except APIError:
             sleep = min(20, 2 ** attempt) + random.uniform(0, 0.5)
+            if (time.perf_counter() - start) + sleep >= overall_deadline:
+                raise TimeoutError("Deadline would be exceeded during backoff sleep")
             logger.warning("🛠️ Service error (attempt %d) → retry in %.1fs", attempt, sleep)
-            if attempt < max_attempts:
-                time.sleep(sleep)
-            else:
-                raise
+            time.sleep(sleep)
 
-    raise RuntimeError("LLM call failed after retries")
+    raise TimeoutError("LLM call failed after retries within deadline")
 
 
 def parse_plan_lines(text: str, plan: Dict[int, str]) -> None:
@@ -195,7 +211,7 @@ Chỉ in đúng {count} dòng theo mẫu trên, không thêm gì khác.
 def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal: str) -> Dict[int, str]:
     """
     Fallback MINIMAL: chỉ dùng để fill phần THIẾU (giữ nguyên ngày đã sinh được).
-    Bạn có thể thay bằng fallback chi tiết hơn của bạn nếu muốn.
+    Bạn có thể thay bằng fallback chi tiết hơn nếu muốn.
     """
     plan: Dict[int, str] = {}
     tools = "Google Classroom, YouTube, Khan Academy"
@@ -246,7 +262,20 @@ def generate_learning_path(request):
         plan: Dict[int, str] = {}
         ai_used = False
 
-        resp = call_with_backoff(messages, max_tokens=1400, temperature=0.6, timeout=55.0)
+        try:
+            resp = call_with_backoff(
+                messages,
+                max_tokens=1400,
+                temperature=0.6,
+                overall_deadline=55.0,     # < gunicorn timeout
+                per_attempt_timeout=25.0,
+                max_attempts=4,
+                stop=None,
+            )
+        except TimeoutError as e:
+            logger.warning("LLM overall timeout: %s", e)
+            return Response({"error": "AI đang chậm, vui lòng thử lại sau."}, status=504)
+
         text = (resp.choices[0].message.content or "").strip()
         parse_plan_lines(text, plan)
         logger.info("Parsed %d/28 days (first pass)", len(plan))
@@ -257,7 +286,20 @@ def generate_learning_path(request):
             missing = sorted([d for d in range(1, 29) if d not in plan])
             logger.info("Missing %d days: %s", len(missing), missing)
             cont_msgs = make_continue_messages(missing, subject)
-            resp2 = call_with_backoff(cont_msgs, max_tokens=600, temperature=0.5, timeout=40.0)
+            try:
+                resp2 = call_with_backoff(
+                    cont_msgs,
+                    max_tokens=600,
+                    temperature=0.5,
+                    overall_deadline=40.0,   # vòng bổ sung ngắn hơn
+                    per_attempt_timeout=20.0,
+                    max_attempts=3,
+                    stop=None,
+                )
+            except TimeoutError:
+                logger.warning("Continue phase timed out; will fill missing with fallback later.")
+                break
+
             text2 = (resp2.choices[0].message.content or "").strip()
             parse_plan_lines(text2, plan)
             logger.info("After continue #%d → %d/28 days", tries + 1, len(plan))
