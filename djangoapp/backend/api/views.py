@@ -45,26 +45,22 @@ def get_openai_client() -> OpenAI:
     api_key = os.environ.get("DEEPINFRA_API_KEY")
     if not api_key:
         raise RuntimeError("DEEPINFRA_API_KEY is required")
-    client = OpenAI(
+    return OpenAI(
         api_key=api_key,
         base_url="https://api.deepinfra.com/v1/openai",
-        timeout=60.0,  # client-level timeout (một lần gọi)
+        timeout=60.0,  # client-level timeout
     )
-    return client
-
 
 # =====================================================
 # Helpers
 # =====================================================
 def normalize_status(value: str) -> str:
-    """Normalize arbitrary status strings into 'pending' or 'done'."""
     if not value:
         return "pending"
-    v = value.strip().lower()
-    return "done" if v == "done" else "pending"
+    return "done" if value.strip().lower() == "done" else "pending"
 
 
-# Regex siết chặt: BẮT BUỘC 'Ngày N:' (chấp nhận :, ：, -, –, — sau chữ số)
+# Bắt buộc dòng hợp lệ bắt đầu "Ngày N:" và có nội dung, chấp nhận :, ：, -, –, —
 LINE_REGEX = re.compile(r"^Ngày\s+(\d{1,2})\s*[:：\-–—]\s*(.+)$", re.IGNORECASE)
 
 
@@ -72,17 +68,16 @@ def call_with_backoff(
     messages: List[Dict],
     *,
     model: str = "openchat/openchat_3.5",
-    max_tokens: int = 1400,
+    max_tokens: int = 1100,           # giảm tải phản hồi
     temperature: float = 0.6,
-    # Tổng hạn mức cho cả hàm (retry + sleep + các lần gọi)
-    overall_deadline: float = 55.0,     # < gunicorn timeout (ví dụ 120s)
-    per_attempt_timeout: float = 25.0,  # timeout cho MỖI lần gọi
-    max_attempts: int = 5,
+    overall_deadline: float = 55.0,   # < gunicorn --timeout (khuyến nghị 120)
+    per_attempt_timeout: float = 22.0,
+    max_attempts: int = 4,
     stop: List[str] | None = None,
 ):
     """
-    Gọi LLM với retry + exponential backoff + jitter và tôn trọng overall deadline.
-    Nếu hết thời gian tổng, raise TimeoutError để view chủ động trả 504.
+    Gọi LLM với retry + exponential backoff, luôn tôn trọng tổng deadline
+    để tránh worker timeout và giảm tải chờ đợi.
     """
     client = get_openai_client()
     start = time.perf_counter()
@@ -93,7 +88,7 @@ def call_with_backoff(
         if remain <= 0:
             raise TimeoutError("Overall LLM deadline exceeded")
 
-        # timeout của lần gọi này không vượt quá tổng thời gian còn lại
+        # Không để mỗi attempt vượt quá thời gian tổng còn lại
         per_timeout = max(5.0, min(per_attempt_timeout, remain - 1.0))
 
         try:
@@ -116,21 +111,22 @@ def call_with_backoff(
             raise
 
         except RateLimitError:
-            sleep = min(60, 2 ** attempt) + random.uniform(0, 0.5)
+            # backoff nhưng không vượt deadline
+            sleep = min(40, 2 ** attempt) + random.uniform(0, 0.4)
             if (time.perf_counter() - start) + sleep >= overall_deadline:
                 raise TimeoutError("Deadline would be exceeded during backoff sleep")
             logger.warning("⏳ 429 (attempt %d) → retry in %.1fs", attempt, sleep)
             time.sleep(sleep)
 
         except APIConnectionError:
-            sleep = min(20, 2 ** attempt) + random.uniform(0, 0.5)
+            sleep = min(15, 2 ** attempt) + random.uniform(0, 0.4)
             if (time.perf_counter() - start) + sleep >= overall_deadline:
                 raise TimeoutError("Deadline would be exceeded during backoff sleep")
             logger.warning("🌐 Network (attempt %d) → retry in %.1fs", attempt, sleep)
             time.sleep(sleep)
 
         except APIError:
-            sleep = min(20, 2 ** attempt) + random.uniform(0, 0.5)
+            sleep = min(15, 2 ** attempt) + random.uniform(0, 0.4)
             if (time.perf_counter() - start) + sleep >= overall_deadline:
                 raise TimeoutError("Deadline would be exceeded during backoff sleep")
             logger.warning("🛠️ Service error (attempt %d) → retry in %.1fs", attempt, sleep)
@@ -140,9 +136,7 @@ def call_with_backoff(
 
 
 def parse_plan_lines(text: str, plan: Dict[int, str]) -> None:
-    """
-    Thêm các dòng hợp lệ vào plan (KHÔNG ghi đè ngày đã có).
-    """
+    """Thêm dòng hợp lệ vào plan (không ghi đè ngày đã có)."""
     if not text:
         return
     for raw in text.splitlines():
@@ -162,7 +156,10 @@ def parse_plan_lines(text: str, plan: Dict[int, str]) -> None:
 
 def make_main_messages(class_level: str, subject: str, study_time: str, goal: str) -> List[Dict]:
     """
-    Prompt chính: ép định dạng 'Ngày N:' + ≤120 ký tự + không dòng trống.
+    Prompt chính, giảm token:
+      - Ngày 1: có 'CÔNG CỤ HỖ TRỢ'
+      - Ngày 2→28: KHÔNG lặp lại phần 'CÔNG CỤ HỖ TRỢ'
+      - Mỗi dòng ≤ 115 ký tự để tiết kiệm tokens
     """
     return [
         {
@@ -172,37 +169,61 @@ def make_main_messages(class_level: str, subject: str, study_time: str, goal: st
         {
             "role": "user",
             "content": f"""
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, môn {subject}, mỗi ngày {study_time}. Mục tiêu: {goal}.
+Lập kế hoạch 4 tuần (28 ngày) cho lớp {class_level}, môn {subject}, mỗi ngày {study_time}. Mục tiêu: {goal}.
 YÊU CẦU:
-- CHÍNH XÁC 28 dòng (Ngày 1 → Ngày 28), mỗi dòng ≤ 120 ký tự, KHÔNG dòng trống.
-- Mỗi dòng BẮT ĐẦU chính xác: 'Ngày N:' (có dấu hai chấm), không ký tự nào khác phía trước.
-- Nội dung theo CT GDPT 2018. Ngày 28 = ÔN TẬP & KIỂM TRA TỔNG HỢP.
+- CHÍNH XÁC 28 dòng (Ngày 1→28), mỗi dòng ≤ 115 ký tự, KHÔNG dòng trống.
+- Mỗi dòng BẮT ĐẦU: 'Ngày N:' (có dấu hai chấm), không ký tự khác phía trước.
+- Theo CT GDPT 2018. Ngày 28 = ÔN TẬP & KIỂM TRA TỔNG HỢP.
 - KHÔNG tiêu đề/markdown/code block/giải thích.
-ĐỊNH DẠNG (mỗi dòng):
-Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý> | CÔNG CỤ HỖ TRỢ: <ứng dụng liên quan đến môn {subject}>
+
+QUY TẮC 'CÔNG CỤ HỖ TRỢ':
+- Ngày 1: PHẢI có ' | CÔNG CỤ HỖ TRỢ: <ứng dụng liên quan đến môn {subject}>'.
+- Ngày 2→28: KHÔNG thêm phần 'CÔNG CỤ HỖ TRỢ'.
+
+ĐỊNH DẠNG:
+- Ngày 1:
+  Ngày 1: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý> | CÔNG CỤ HỖ TRỢ: <ứng dụng>
+- Ngày 2→28:
+  Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý>
+
 Chỉ in đúng 28 dòng theo mẫu, không thêm gì khác.
 """.strip(),
         },
     ]
 
 
-def make_continue_messages(missing_days: List[int], subject: str) -> List[Dict]:
+def make_continue_messages(missing_days: List[int], subject: str, day1_tools_required: bool) -> List[Dict]:
     """
-    Prompt tiếp tục: chỉ in CHÍNH XÁC các ngày còn thiếu (không in ngày khác).
+    Prompt bổ sung:
+      - Nếu thiếu Ngày 1 → Ngày 1 phải có 'CÔNG CỤ HỖ TRỢ'
+      - Các ngày khác KHÔNG 'CÔNG CỤ HỖ TRỢ'
     """
     days_str = ", ".join(str(d) for d in missing_days)
     count = len(missing_days)
+    tools_rule = (
+        f"- Trong danh sách có Ngày 1 → Ngày 1 PHẢI có ' | CÔNG CỤ HỖ TRỢ: <ứng dụng liên quan đến môn {subject}>'\n"
+        "- Các ngày khác KHÔNG thêm phần 'CÔNG CỤ HỖ TRỢ'."
+        if day1_tools_required
+        else "- KHÔNG thêm 'CÔNG CỤ HỖ TRỢ' cho bất kỳ ngày nào (Ngày 1 đã có trước đó)."
+    )
     return [
         {"role": "system", "content": "Tiếp tục kế hoạch, giữ nguyên định dạng và yêu cầu."},
         {
             "role": "user",
             "content": f"""
 In CHÍNH XÁC {count} dòng tương ứng các ngày: {days_str}.
-Mỗi dòng BẮT ĐẦU đúng 'Ngày N:' (có dấu hai chấm), mỗi dòng ≤ 120 ký tự, KHÔNG dòng trống.
-KHÔNG in lại các ngày không nằm trong danh sách trên. KHÔNG tiêu đề/markdown/giải thích.
-ĐỊNH DẠNG (mỗi dòng):
-Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý> | CÔNG CỤ HỖ TRỢ: <ứng dụng liên quan đến môn {subject}>
-Chỉ in đúng {count} dòng theo mẫu trên, không thêm gì khác.
+Mỗi dòng BẮT ĐẦU 'Ngày N:' (có dấu hai chấm), mỗi dòng ≤ 115 ký tự, KHÔNG dòng trống.
+KHÔNG in ngày ngoài danh sách. KHÔNG tiêu đề/markdown/giải thích.
+
+{tools_rule}
+
+ĐỊNH DẠNG:
+- Nếu là Ngày 1 (khi nằm trong danh sách):
+  Ngày 1: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý> | CÔNG CỤ HỖ TRỢ: <ứng dụng>
+- Các ngày khác:
+  Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý>
+
+Chỉ in đúng {count} dòng theo mẫu, không thêm gì khác.
 """.strip(),
         },
     ]
@@ -210,23 +231,33 @@ Chỉ in đúng {count} dòng theo mẫu trên, không thêm gì khác.
 
 def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal: str) -> Dict[int, str]:
     """
-    Fallback MINIMAL: chỉ dùng để fill phần THIẾU (giữ nguyên ngày đã sinh được).
-    Bạn có thể thay bằng fallback chi tiết hơn nếu muốn.
+    Fallback ngắn gọn (giảm token):
+    - Ngày 1: có 'CÔNG CỤ HỖ TRỢ'
+    - Ngày 2→28: không có phần 'CÔNG CỤ HỖ TRỢ'
     """
     plan: Dict[int, str] = {}
     tools = "Google Classroom, YouTube, Khan Academy"
-    for day in range(1, 29):
-        if day == 28:
-            task = (f"Ngày {day}: ÔN TẬP & KIỂM TRA TỔNG HỢP - {goal} | "
-                    f"TỪ KHÓA TÌM KIẾM: {subject} ôn tập tổng hợp lớp {class_level} | "
-                    f"Bài tập tự luyện: Làm đề thi thử 120 phút | CÔNG CỤ HỖ TRỢ: {tools}")
-        else:
-            task = (f"Ngày {day}: Ôn tập/chủ đề liên quan {goal} - {subject} | "
-                    f"TỪ KHÓA TÌM KIẾM: {subject} lớp {class_level} {goal} | "
-                    f"Bài tập tự luyện: Thực hành {study_time} | CÔNG CỤ HỖ TRỢ: {tools}")
-        plan[day] = task
-    return plan
 
+    for day in range(1, 29):
+        if day == 1:
+            plan[day] = (
+                f"Ngày 1: Định hướng & tài nguyên học - {subject} | "
+                f"TỪ KHÓA TÌM KIẾM: {subject} lớp {class_level} tài nguyên | "
+                f"Bài tập tự luyện: Thiết lập môi trường | CÔNG CỤ HỖ TRỢ: {tools}"
+            )
+        elif day == 28:
+            plan[day] = (
+                f"Ngày 28: ÔN TẬP & KIỂM TRA TỔNG HỢP - {goal} | "
+                f"TỪ KHÓA TÌM KIẾM: {subject} đề thi thử | "
+                f"Bài tập tự luyện: Làm đề full {study_time}"
+            )
+        else:
+            plan[day] = (
+                f"Ngày {day}: Ôn tập/chủ đề liên quan {goal} - {subject} | "
+                f"TỪ KHÓA TÌM KIẾM: {subject} lớp {class_level} {goal} | "
+                f"Bài tập tự luyện: Thực hành {study_time}"
+            )
+    return plan
 
 # =====================================================
 # Generate learning path
@@ -235,13 +266,7 @@ def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
     """
-    Body JSON:
-    {
-      "class_level": "10",
-      "subject": "Tin học",
-      "study_time": "1 giờ",
-      "goal": "Nắm vững Python cơ bản"
-    }
+    Sinh kế hoạch 28 ngày (giảm tải bằng prompt ngắn gọn + max_tokens nhỏ + deadline tổng).
     """
     try:
         user = request.user
@@ -255,7 +280,7 @@ def generate_learning_path(request):
         if not all([class_level, subject, study_time, goal]):
             return Response({"error": "Thiếu thông tin bắt buộc."}, status=400)
 
-        # 1) Gọi lần 1: yêu cầu đủ 28 dòng, định dạng chặt
+        # 1) Lần 1: yêu cầu đủ 28 dòng
         messages = make_main_messages(class_level, subject, study_time, goal)
         logger.info("Calling DeepInfra (main 28 lines)...")
 
@@ -265,10 +290,10 @@ def generate_learning_path(request):
         try:
             resp = call_with_backoff(
                 messages,
-                max_tokens=1400,
+                max_tokens=1100,
                 temperature=0.6,
                 overall_deadline=55.0,     # < gunicorn timeout
-                per_attempt_timeout=25.0,
+                per_attempt_timeout=22.0,
                 max_attempts=4,
                 stop=None,
             )
@@ -280,19 +305,23 @@ def generate_learning_path(request):
         parse_plan_lines(text, plan)
         logger.info("Parsed %d/28 days (first pass)", len(plan))
 
-        # 2) Nếu thiếu → tiếp tục in CHÍNH XÁC các ngày còn thiếu (tối đa 2 vòng)
+        # 2) Nếu thiếu → in CHÍNH XÁC các ngày còn thiếu (tối đa 2 vòng)
         tries = 0
         while len(plan) < 28 and tries < 2:
             missing = sorted([d for d in range(1, 29) if d not in plan])
             logger.info("Missing %d days: %s", len(missing), missing)
-            cont_msgs = make_continue_messages(missing, subject)
+            cont_msgs = make_continue_messages(
+                missing,
+                subject,
+                day1_tools_required=(1 in missing),
+            )
             try:
                 resp2 = call_with_backoff(
                     cont_msgs,
-                    max_tokens=600,
+                    max_tokens=400,           # nhỏ hơn để giảm tải
                     temperature=0.5,
-                    overall_deadline=40.0,   # vòng bổ sung ngắn hơn
-                    per_attempt_timeout=20.0,
+                    overall_deadline=40.0,
+                    per_attempt_timeout=18.0,
                     max_attempts=3,
                     stop=None,
                 )
@@ -308,7 +337,7 @@ def generate_learning_path(request):
         if len(plan) > 0:
             ai_used = True
 
-        # 3) Nếu vẫn còn thiếu → CHỈ fill phần THIẾU bằng fallback (không đè phần đã có)
+        # 3) Còn thiếu → chỉ fill phần thiếu bằng fallback (không đè phần đã có)
         if len(plan) < 28:
             fb = generate_fallback_plan(class_level, subject, study_time, goal)
             for d in range(1, 29):
@@ -316,21 +345,22 @@ def generate_learning_path(request):
                     plan[d] = fb[d]
             logger.info("Filled missing days with fallback → %d/28 days", len(plan))
 
-        # 4) Lưu DB (xóa cũ theo môn của user, tạo mới)
+        # 4) Lưu DB
         with transaction.atomic():
             ProgressLog.objects.filter(user=user, subject=subject).delete()
             objs = []
             for day in range(1, 29):
-                task_text = plan[day]
                 week = (day - 1) // 7 + 1
-                objs.append(ProgressLog(
-                    user=user,
-                    subject=subject,
-                    week=week,
-                    day_number=day,
-                    task_title=task_text,
-                    status="pending",
-                ))
+                objs.append(
+                    ProgressLog(
+                        user=user,
+                        subject=subject,
+                        week=week,
+                        day_number=day,
+                        task_title=plan[day],
+                        status="pending",
+                    )
+                )
             ProgressLog.objects.bulk_create(objs)
 
         logs = ProgressLog.objects.filter(user=user, subject=subject).order_by("week", "day_number")
@@ -340,7 +370,7 @@ def generate_learning_path(request):
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
                 "ai_generated": ai_used,
-                "note": "Siết định dạng & chỉ bổ sung phần thiếu (không full fallback).",
+                "note": "Ngày 1 có 'CÔNG CỤ HỖ TRỢ', các ngày sau không lặp lại; tối ưu token + deadline.",
             },
             status=201,
         )
@@ -356,7 +386,6 @@ def generate_learning_path(request):
     except Exception as e:
         logger.exception("Unexpected error in generate_learning_path")
         return Response({"error": "Lỗi không xác định", "details": str(e)[:200]}, status=500)
-
 
 # =====================================================
 # Get progress list
@@ -374,7 +403,6 @@ def get_progress_list(request):
     except Exception as e:
         logger.exception("Error in get_progress_list: %s", e)
         return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
-
 
 # =====================================================
 # Update progress status
@@ -405,7 +433,6 @@ def update_progress_status(request):
         logger.exception("Error in update_progress_status: %s", e)
         return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
 
-
 # =====================================================
 # Auth & CSRF endpoints
 # =====================================================
@@ -414,7 +441,6 @@ def update_progress_status(request):
 @permission_classes([AllowAny])
 def get_csrf(request):
     return Response({"csrfToken": request.META.get("CSRF_COOKIE", "")})
-
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
@@ -427,7 +453,6 @@ def register(request):
             status=201,
         )
     return Response(serializer.errors, status=400)
-
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
@@ -442,13 +467,11 @@ def login_view(request):
     login(request, user)
     return Response({"message": "Đăng nhập thành công!", "username": user.username})
 
-
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def logout_view(request):
     logout(request)
     return Response({"message": "Đã đăng xuất."})
-
 
 @api_view(["GET"])
 @permission_classes([AllowAny])
