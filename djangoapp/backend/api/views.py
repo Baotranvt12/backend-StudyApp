@@ -68,7 +68,7 @@ def call_with_backoff(
     messages: List[Dict],
     *,
     model: str = "openchat/openchat_3.5",
-    max_tokens: int = 1100,           # giảm tải phản hồi
+    max_tokens: int = 1200,           # giảm tải phản hồi
     temperature: float = 0.6,
     overall_deadline: float = 55.0,   # < gunicorn --timeout (khuyến nghị 120)
     per_attempt_timeout: float = 22.0,
@@ -164,7 +164,7 @@ def make_main_messages(class_level: str, subject: str, study_time: str, goal: st
     return [
         {
             "role": "system",
-            "content": "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% bằng tiếng Việt."
+            "content": "Bạn là chuyên gia lập kế hoạch tự học có 10 năm kinh nghiệm. Trả lời 100% bằng tiếng Việt."
         },
         {
             "role": "user",
@@ -173,7 +173,7 @@ Lập kế hoạch 4 tuần (28 ngày) cho lớp {class_level}, môn {subject}, 
 YÊU CẦU:
 - CHÍNH XÁC 28 dòng (Ngày 1→28), mỗi dòng ≤ 115 ký tự, KHÔNG dòng trống.
 - Mỗi dòng BẮT ĐẦU: 'Ngày N:' (có dấu hai chấm), không ký tự khác phía trước.
-- Theo CT GDPT 2018. Ngày 28 = ÔN TẬP & KIỂM TRA TỔNG HỢP.
+- Theo chương trình giáo dục năm 2018. Ngày 28 = ÔN TẬP & KIỂM TRA TỔNG HỢP.
 - KHÔNG tiêu đề/markdown/code block/giải thích.
 
 QUY TẮC 'CÔNG CỤ HỖ TRỢ':
@@ -236,7 +236,7 @@ def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal
     - Ngày 2→28: không có phần 'CÔNG CỤ HỖ TRỢ'
     """
     plan: Dict[int, str] = {}
-    tools = "Google Classroom, YouTube, Khan Academy"
+    tools = "YouTube, VietJack, OML"
 
     for day in range(1, 29):
         if day == 1:
