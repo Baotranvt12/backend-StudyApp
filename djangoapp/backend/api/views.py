@@ -33,7 +33,6 @@ DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
 DEEPINFRA_MODEL = os.environ.get("DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
 
 if not DEEPINFRA_API_KEY:
-    # Cho phép dev chạy tạm nếu DJANGO_DEBUG=true
     if os.environ.get("DJANGO_DEBUG", "false").lower() == "true":
         logger.warning("DEEPINFRA_API_KEY is missing. Using a placeholder for development only!")
         DEEPINFRA_API_KEY = "your_development_key_here"
@@ -65,11 +64,9 @@ def normalize_status(value: str) -> str:
 # =========================
 LLM_MODEL = DEEPINFRA_MODEL
 DAY_LINE_RE = re.compile(r"^Ngày\s+([1-9]|1\d|2[0-8])\s*:", re.IGNORECASE)
+TOOLS_FIELD_RE = re.compile(r"\|\s*CÔNG CỤ HỖ TRỢ\s*:", re.IGNORECASE)
 
 def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
-    """
-    Gọi DeepInfra (OpenAI-compatible).
-    """
     return openai.chat.completions.create(
         model=LLM_MODEL,
         messages=messages,
@@ -78,14 +75,9 @@ def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
         temperature=temperature,
         top_p=1,
         stop=stop or ["\nNgày 29", "Ngày 29:"],
-        # timeout có thể không được tất cả backend hỗ trợ; bỏ nếu không cần
-        # timeout=120.0,
     )
 
 def _extract_plan_lines(text: str) -> dict:
-    """
-    Trích các dòng hợp lệ theo mẫu 'Ngày N: ...' -> dict {day:int -> line:str}
-    """
     plan = {}
     for raw in (text or "").splitlines():
         line = raw.strip()
@@ -102,25 +94,17 @@ def _extract_plan_lines(text: str) -> dict:
 def _missing_days(plan: dict) -> list:
     return [d for d in range(1, 29) if d not in plan]
 
-def _cleanup_tools(plan: dict):
+def _ensure_tools_all_days(plan: dict, subject: str):
     """
-    Chỉ cho phép 'CÔNG CỤ HỖ TRỢ' ở Ngày 1.
-    Với ngày 2..28, loại bỏ phần ' | CÔNG CỤ HỖ TRỢ: ...' nếu có.
+    Đảm bảo mọi ngày đều có ' | CÔNG CỤ HỖ TRỢ: ...'.
+    Nếu thiếu, tự động thêm với gợi ý chung theo môn học.
     """
     for d, line in list(plan.items()):
-        if d == 1:
-            continue
-        plan[d] = re.sub(
-            r"\s*\|\s*CÔNG CỤ HỖ TRỢ:.*$",
-            "",
-            line,
-            flags=re.IGNORECASE,
-        )
+        if not TOOLS_FIELD_RE.search(line):
+            # thêm một nhánh công cụ tối giản, tránh phá cấu trúc còn lại
+            plan[d] = f"{line} | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
 
 def _enforce_len(plan: dict, limit=90):
-    """
-    (Tuỳ chọn) Chỉ cảnh báo nếu vượt 90 ký tự; không tự động cắt để tránh mất nghĩa.
-    """
     too_long = [d for d, line in plan.items() if len(line) > limit]
     if too_long:
         logger.warning(f"Có {len(too_long)} dòng vượt {limit} ký tự: {too_long}")
@@ -156,7 +140,7 @@ def generate_learning_path(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # --------- Prompt chặt chẽ + skeleton 28 dòng ---------
+        # --------- Prompt + skeleton: NGÀY NÀO CŨNG CÓ CÔNG CỤ HỖ TRỢ ---------
         system_msg = (
             "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt. "
             "PHẢI in đúng 28 dòng từ 'Ngày 1:' đến 'Ngày 28:'; mỗi dòng ≤ 90 ký tự; "
@@ -166,17 +150,13 @@ def generate_learning_path(request):
 
         skeleton = []
         for d in range(1, 29):
-            if d == 1:
+            if d == 28:
                 skeleton.append(
-                    f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
-                )
-            elif d == 28:
-                skeleton.append(
-                    "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử>"
+                    "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
                 )
             else:
                 skeleton.append(
-                    f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý>"
+                    f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
                 )
         skeleton_text = "\n".join(skeleton)
 
@@ -186,7 +166,7 @@ Bám CT GDPT 2018, tăng dần độ khó, không gộp 2 ngày vào 1.
 
 Hãy THAY THẾ các <...> trong KHUNG sau và GIỮ NGUYÊN tiền tố "Ngày N:".
 Nếu thiếu dòng nào, tự bổ sung đến đủ 28 dòng.
-Chỉ ghi "CÔNG CỤ HỖ TRỢ" ở Ngày 1; các ngày còn lại KHÔNG có phần này.
+Mọi ngày (1–28) đều PHẢI có ' | CÔNG CỤ HỖ TRỢ: ... '.
 
 {skeleton_text}
 
@@ -234,15 +214,11 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
             for d in missing:
                 if d == 28:
                     cont_lines.append(
-                        "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử>"
-                    )
-                elif d == 1:
-                    cont_lines.append(
-                        f"Ngày 1: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                        "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
                     )
                 else:
                     cont_lines.append(
-                        f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý>"
+                        f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
                     )
             cont_prompt += "\n".join(cont_lines)
 
@@ -265,30 +241,26 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
             plan.update(plan2)
             logger.info(f"After continuation, parsed days: {sorted(plan.keys())}")
 
-        # --------- Hậu kiểm & làm sạch ---------
-        _cleanup_tools(plan)       # chỉ tool ở Ngày 1
-        _enforce_len(plan, 90)     # cảnh báo nếu > 90 ký tự/dòng
+        # --------- Hậu kiểm & đảm bảo đủ trường Công cụ ---------
+        _ensure_tools_all_days(plan, subject)
+        _enforce_len(plan, 90)
 
-        # Nếu vẫn chưa đủ 28 ngày, fallback mặc định
+        # Nếu vẫn chưa đủ 28 ngày, fallback mặc định (có CÔNG CỤ HỖ TRỢ)
         if len(plan) != 28:
             logger.warning(f"Expected 28 days but got {len(plan)}. Fallback default plan.")
             plan = {}
             for day in range(1, 29):
-                if day == 1:
-                    line = (
-                        f"Ngày 1: Ôn {subject} cơ bản, đặt mục tiêu {goal} | "
-                        f"TỪ KHÓA: {subject} nhập môn | BT: 15' thực hành | "
-                        f"CÔNG CỤ HỖ TRỢ: Google Classroom"
-                    )
-                elif day == 28:
+                if day == 28:
                     line = (
                         f"Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - mục tiêu {goal} | "
-                        f"TỪ KHÓA: đề tổng hợp | BT: đề thử"
+                        f"TỪ KHÓA: đề tổng hợp | BT: đề thử | "
+                        f"CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
                     )
                 else:
                     line = (
                         f"Ngày {day}: Học {subject} theo mục tiêu {goal} | "
-                        f"TỪ KHÓA: {subject} {goal} | BT: 15' thực hành"
+                        f"TỪ KHÓA: {subject} {goal} | BT: 15' thực hành | "
+                        f"CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
                     )
                 plan[day] = line
 
@@ -328,7 +300,7 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
         raw_out = (text1 or "") + ("\n" + text2 if text2 else "")
         return Response(
             {
-                "message": "✅ Đã tạo lộ trình học 28 ngày!",
+                "message": "✅ Đã tạo lộ trình học 28 ngày (có CÔNG CỤ HỖ TRỢ mỗi ngày)!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
                 "raw_gpt_output": raw_out.strip()[:1000],
