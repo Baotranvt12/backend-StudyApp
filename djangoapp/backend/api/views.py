@@ -1,8 +1,6 @@
 # api/views.py
 import os
 import re
-import time
-import random
 import logging
 from functools import lru_cache
 from typing import Dict, List
@@ -126,15 +124,17 @@ def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal
     return plan
 
 # =====================================================
-# LLM core (theo script của bạn: 1 lượt chính + 1 lượt bù)
+# LLM core (script của bạn: 1 lượt chính + 1 lượt bù; timeout ngắn)
 # =====================================================
 def generate_28_lines_with_llm(class_level: str, subject: str, study_time: str, goal: str,
-                               model: str = "meta-llama/Meta-Llama-3-8B-Instruct") -> List[str]:
+                               model: str | None = None) -> List[str]:
     """
     Trả về danh sách các dòng 'Ngày N: ...' (có thể < 28 nếu model thiếu; view sẽ fallback).
-    Timeout ngắn để tránh 504.
+    Timeout ngắn để tránh 504. Model có thể set qua biến môi trường DEEPINFRA_MODEL.
     """
     client = get_openai_client()
+    model = model or os.environ.get("DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+
     skeleton_text = _make_skeleton(subject)
     user_msg = _make_user_msg(class_level, subject, study_time, goal, skeleton_text)
 
