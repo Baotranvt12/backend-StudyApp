@@ -1,9 +1,6 @@
-# api/views.py
 import os
 import re
 import logging
-from functools import lru_cache
-from typing import Dict, List
 
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
@@ -15,7 +12,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
 
-from openai import OpenAI  # DeepInfra OpenAI-compatible
+from openai import OpenAI
 
 from .models import ProgressLog
 from .serializers import (
@@ -24,253 +21,334 @@ from .serializers import (
     UserSerializer,
 )
 
-# =====================================================
+# =========================
 # Logging
-# =====================================================
+# =========================
 logger = logging.getLogger(__name__)
 
-# =====================================================
-# OpenAI (DeepInfra) client - lazy init
-# =====================================================
-@lru_cache(maxsize=1)
-def get_openai_client() -> OpenAI:
-    """
-    Ưu tiên DEEPINFRA_KEY; fallback DEEPINFRA_API_KEY cho tương thích cũ.
-    """
-    api_key = os.environ.get("DEEPINFRA_KEY") or os.environ.get("DEEPINFRA_API_KEY")
-    if not api_key:
-        raise RuntimeError("DEEPINFRA_KEY (hoặc DEEPINFRA_API_KEY) is required")
-    return OpenAI(
-        api_key=api_key,
+# =========================
+# OpenAI (DeepInfra) client
+# =========================
+DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
+DEEPINFRA_MODEL = os.environ.get("DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+
+if not DEEPINFRA_API_KEY:
+    # Cho phép dev chạy tạm nếu DJANGO_DEBUG=true
+    if os.environ.get("DJANGO_DEBUG", "false").lower() == "true":
+        logger.warning("DEEPINFRA_API_KEY is missing. Using a placeholder for development only!")
+        DEEPINFRA_API_KEY = "your_development_key_here"
+    else:
+        raise ValueError("DEEPINFRA_API_KEY environment variable is required in production")
+
+try:
+    openai = OpenAI(
+        api_key=DEEPINFRA_API_KEY,
         base_url="https://api.deepinfra.com/v1/openai",
     )
+    logger.info("OpenAI client initialized successfully.")
+except Exception as e:
+    logger.error(f"Failed to initialize OpenAI client: {e}")
+    raise
 
-# =====================================================
+# =========================
 # Helpers
-# =====================================================
+# =========================
 def normalize_status(value: str) -> str:
+    """Normalize arbitrary status strings into 'pending' or 'done'."""
     if not value:
         return "pending"
-    return "done" if value.strip().lower() == "done" else "pending"
+    v = str(value).strip().lower()
+    return "done" if v == "done" else "pending"
 
-# Bắt đầu đúng "Ngày N:" (1..28)
-DAY_HEAD_RE = re.compile(r"^Ngày\s+([1-9]|1\d|2[0-8]):", re.IGNORECASE)
+# =========================
+# LLM helpers
+# =========================
+LLM_MODEL = DEEPINFRA_MODEL
+DAY_LINE_RE = re.compile(r"^Ngày\s+([1-9]|1\d|2[0-8])\s*:", re.IGNORECASE)
 
-def _count_ok(lines: List[str]) -> int:
-    return sum(1 for ln in lines if DAY_HEAD_RE.match(ln.strip()))
-
-def _parse_lines(text: str) -> List[str]:
-    return [ln.strip() for ln in (text or "").splitlines() if ln.strip()]
-
-def _make_skeleton(subject: str) -> str:
-    sk = []
-    for d in range(1, 29):
-        if d == 1:
-            sk.append(
-                f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
-            )
-        elif d == 28:
-            sk.append(
-                "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử>"
-            )
-        else:
-            sk.append(f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý>")
-    return "\n".join(sk)
-
-SYSTEM_MSG = (
-    "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt. "
-    "PHẢI in đúng 28 dòng từ 'Ngày 1:' đến 'Ngày 28:'; mỗi dòng ≤ 90 ký tự; "
-    "không tiêu đề/markdown; không dòng trống; mỗi số ngày dùng đúng 1 lần; "
-    "không thêm mô tả ngoài 28 dòng."
-)
-
-def _make_user_msg(class_level: str, subject: str, study_time: str, goal: str, skeleton_text: str) -> str:
-    return f"""
-Học sinh lớp {class_level}, môn {subject}, thời lượng {study_time}/ngày. Mục tiêu: {goal}.
-Bám CT GDPT 2018, tăng dần độ khó, không gộp 2 ngày vào 1.
-
-Hãy THAY THẾ các <...> trong KHUNG sau và GIỮ NGUYÊN tiền tố "Ngày N:".
-Nếu thiếu dòng nào, tự bổ sung đến đủ 28 dòng.
-Chỉ ghi "CÔNG CỤ HỖ TRỢ" ở Ngày 1; các ngày còn lại KHÔNG lặp lại phần này.
-
-{skeleton_text}
-
-Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
-""".strip()
-
-def generate_fallback_plan(class_level: str, subject: str, study_time: str, goal: str) -> Dict[int, str]:
+def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
     """
-    Fallback ngắn gọn: Ngày 1 có 'CÔNG CỤ HỖ TRỢ', các ngày còn lại không lặp lại.
+    Gọi DeepInfra (OpenAI-compatible).
     """
-    plan: Dict[int, str] = {}
-    tools = "YouTube, VietJack, OLM"
-    for day in range(1, 29):
-        if day == 1:
-            plan[day] = (
-                f"Ngày 1: Định hướng & tài nguyên học - {subject} | "
-                f"TỪ KHÓA: {subject} lớp {class_level} tài nguyên | "
-                f"BT: Thiết lập môi trường | CÔNG CỤ HỖ TRỢ: {tools}"
-            )
-        elif day == 28:
-            plan[day] = (
-                f"Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - {goal} | "
-                f"TỪ KHÓA: {subject} đề thi thử | BT: Làm đề full {study_time}"
-            )
-        else:
-            plan[day] = (
-                f"Ngày {day}: Chủ đề liên quan {goal} - {subject} | "
-                f"TỪ KHÓA: {subject} lớp {class_level} {goal} | BT: Thực hành {study_time}"
-            )
+    return openai.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        stream=False,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        top_p=1,
+        stop=stop or ["\nNgày 29", "Ngày 29:"],
+        # timeout có thể không được tất cả backend hỗ trợ; bỏ nếu không cần
+        # timeout=120.0,
+    )
+
+def _extract_plan_lines(text: str) -> dict:
+    """
+    Trích các dòng hợp lệ theo mẫu 'Ngày N: ...' -> dict {day:int -> line:str}
+    """
+    plan = {}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = DAY_LINE_RE.match(line)
+        if not m:
+            continue
+        day = int(m.group(1))
+        if 1 <= day <= 28:
+            plan[day] = line
     return plan
 
-# =====================================================
-# LLM core (script của bạn: 1 lượt chính + 1 lượt bù; timeout ngắn)
-# =====================================================
-def generate_28_lines_with_llm(class_level: str, subject: str, study_time: str, goal: str,
-                               model: str | None = None) -> List[str]:
+def _missing_days(plan: dict) -> list:
+    return [d for d in range(1, 29) if d not in plan]
+
+def _cleanup_tools(plan: dict):
     """
-    Trả về danh sách các dòng 'Ngày N: ...' (có thể < 28 nếu model thiếu; view sẽ fallback).
-    Timeout ngắn để tránh 504. Model có thể set qua biến môi trường DEEPINFRA_MODEL.
+    Chỉ cho phép 'CÔNG CỤ HỖ TRỢ' ở Ngày 1.
+    Với ngày 2..28, loại bỏ phần ' | CÔNG CỤ HỖ TRỢ: ...' nếu có.
     """
-    client = get_openai_client()
-    model = model or os.environ.get("DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+    for d, line in list(plan.items()):
+        if d == 1:
+            continue
+        plan[d] = re.sub(
+            r"\s*\|\s*CÔNG CỤ HỖ TRỢ:.*$",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        )
 
-    skeleton_text = _make_skeleton(subject)
-    user_msg = _make_user_msg(class_level, subject, study_time, goal, skeleton_text)
+def _enforce_len(plan: dict, limit=90):
+    """
+    (Tuỳ chọn) Chỉ cảnh báo nếu vượt 90 ký tự; không tự động cắt để tránh mất nghĩa.
+    """
+    too_long = [d for d, line in plan.items() if len(line) > limit]
+    if too_long:
+        logger.warning(f"Có {len(too_long)} dòng vượt {limit} ký tự: {too_long}")
 
-    # ---- Lượt 1
-    resp = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": SYSTEM_MSG},
-                  {"role": "user", "content": user_msg}],
-        temperature=0.0,
-        top_p=1,
-        max_tokens=2000,
-        stop=["\nNgày 29", "Ngày 29:"],
-        timeout=18.0,  # ngắn để không treo
-    )
-    lines = _parse_lines(resp.choices[0].message.content)
-    if _count_ok(lines) >= 28:
-        ok_lines = [ln for ln in lines if DAY_HEAD_RE.match(ln)]
-        return ok_lines[:28]
-
-    # ---- Lượt 2 (bù phần thiếu)
-    printed_days = set()
-    for ln in lines:
-        m = re.match(r"^Ngày\s+(\d+):", ln)
-        if m:
-            printed_days.add(int(m.group(1)))
-    missing = [d for d in range(1, 29) if d not in printed_days]
-
-    cont_prompt = "In TIẾP đúng các dòng còn thiếu theo format trước, không lặp, không giải thích:\n"
-    for d in missing:
-        if d == 28:
-            cont_prompt += "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử>\n"
-        else:
-            cont_prompt += f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý>\n"
-
-    resp2 = client.chat.completions.create(
-        model=model,
-        messages=[{"role": "system", "content": SYSTEM_MSG},
-                  {"role": "user", "content": cont_prompt.strip()}],
-        temperature=0.0,
-        max_tokens=800,
-        stop=["\nNgày 29", "Ngày 29:"],
-        timeout=10.0,
-    )
-    more_lines = _parse_lines(resp2.choices[0].message.content)
-
-    # Hợp nhất theo ngày (ưu tiên dòng xuất hiện sau cùng cho cùng ngày)
-    all_lines: Dict[int, str] = {}
-    for ln in lines + more_lines:
-        m = re.match(r"^Ngày\s+(\d+):", ln)
-        if m:
-            all_lines[int(m.group(1))] = ln.strip()
-    return [all_lines[d] for d in range(1, 29) if d in all_lines]
-
-# =====================================================
-# Generate learning path (API)
-# =====================================================
+# =========================================
+# Generate learning path (store per-user)
+# =========================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
     """
-    Sinh kế hoạch 28 ngày:
-      - LLM (2 lượt, timeout ngắn) → hậu kiểm
-      - Thiếu thì fallback để luôn đủ 28 ngày
-      - Lưu vào ProgressLog
+    Body JSON:
+    {
+      "class_level": "10",
+      "subject": "Tin học",
+      "study_time": "1 giờ",
+      "goal": "Nắm vững Python cơ bản"
+    }
     """
     try:
-        user = request.user
-        data = request.data
+        logger.info(f"generate_learning_path called by user: {request.user.username}")
+        logger.info(f"Request data: {request.data}")
 
+        data = request.data
         class_level = (data.get("class_level") or "").strip()
         subject     = (data.get("subject") or "").strip()
         study_time  = (data.get("study_time") or "").strip()
         goal        = (data.get("goal") or "").strip()
 
         if not all([class_level, subject, study_time, goal]):
-            return Response({"error": "Thiếu thông tin bắt buộc."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Thiếu thông tin bắt buộc."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-        # 1) Gọi LLM theo script
+        # --------- Prompt chặt chẽ + skeleton 28 dòng ---------
+        system_msg = (
+            "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt. "
+            "PHẢI in đúng 28 dòng từ 'Ngày 1:' đến 'Ngày 28:'; mỗi dòng ≤ 90 ký tự; "
+            "không tiêu đề/markdown; không dòng trống; mỗi số ngày dùng đúng 1 lần; "
+            "không thêm mô tả ngoài 28 dòng."
+        )
+
+        skeleton = []
+        for d in range(1, 29):
+            if d == 1:
+                skeleton.append(
+                    f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                )
+            elif d == 28:
+                skeleton.append(
+                    "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử>"
+                )
+            else:
+                skeleton.append(
+                    f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý>"
+                )
+        skeleton_text = "\n".join(skeleton)
+
+        user_msg = f"""
+Học sinh lớp {class_level}, môn {subject}, thời lượng {study_time}/ngày. Mục tiêu: {goal}.
+Bám CT GDPT 2018, tăng dần độ khó, không gộp 2 ngày vào 1.
+
+Hãy THAY THẾ các <...> trong KHUNG sau và GIỮ NGUYÊN tiền tố "Ngày N:".
+Nếu thiếu dòng nào, tự bổ sung đến đủ 28 dòng.
+Chỉ ghi "CÔNG CỤ HỖ TRỢ" ở Ngày 1; các ngày còn lại KHÔNG có phần này.
+
+{skeleton_text}
+
+Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
+""".strip()
+
+        messages = [
+            {"role": "system", "content": system_msg},
+            {"role": "user",   "content": user_msg},
+        ]
+
+        # --------- Lần gọi 1 ---------
+        logger.info(f"Calling DeepInfra model={LLM_MODEL} (first pass)…")
         try:
-            lines = generate_28_lines_with_llm(class_level, subject, study_time, goal)
-        except Exception as e:
-            logger.warning("LLM error, will fallback. Details: %s", str(e)[:200])
-            lines = []
+            resp = _llm_call(messages, temperature=0.0)
+        except Exception as api_error:
+            logger.error(f"DeepInfra API error (pass1): {api_error}")
+            err = str(api_error).lower()
+            if "api_key" in err:
+                return Response(
+                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."},
+                    status=500,
+                )
+            if "rate" in err:
+                return Response(
+                    {"error": "Đã vượt giới hạn API. Vui lòng thử lại sau."},
+                    status=429,
+                )
+            return Response(
+                {"error": "Lỗi khi gọi AI service", "details": str(api_error)[:200]},
+                status=500,
+            )
 
-        # 2) Ghép vào 'plan' theo số ngày; nếu thiếu sẽ fallback
-        plan: Dict[int, str] = {}
-        for ln in lines:
-            m = re.match(r"^Ngày\s+(\d+):", ln)
-            if m:
-                d = int(m.group(1))
-                if 1 <= d <= 28:
-                    plan[d] = ln
+        text1 = (resp.choices[0].message.content or "").strip()
+        plan = _extract_plan_lines(text1)
+        logger.info(f"Pass1 parsed days: {sorted(plan.keys())}")
 
-        if len(plan) < 28:
-            fb = generate_fallback_plan(class_level, subject, study_time, goal)
-            for d in range(1, 29):
-                if d not in plan:
-                    plan[d] = fb[d]
+        # --------- Nếu thiếu ngày, gọi tiếp để in nốt phần còn thiếu ---------
+        text2 = ""
+        missing = _missing_days(plan)
+        if missing:
+            logger.warning(f"Missing days after pass1: {missing}")
+            cont_lines = []
+            cont_prompt = "In TIẾP đúng các dòng còn thiếu (không lặp, không giải thích):\n"
+            for d in missing:
+                if d == 28:
+                    cont_lines.append(
+                        "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử>"
+                    )
+                elif d == 1:
+                    cont_lines.append(
+                        f"Ngày 1: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                    )
+                else:
+                    cont_lines.append(
+                        f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý>"
+                    )
+            cont_prompt += "\n".join(cont_lines)
 
-        # 3) Lưu DB
-        with transaction.atomic():
-            ProgressLog.objects.filter(user=user, subject=subject).delete()
-            objs = []
+            messages2 = [
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": cont_prompt},
+            ]
+            logger.info("Calling DeepInfra (continuation)…")
+            try:
+                resp2 = _llm_call(messages2, max_tokens=800, temperature=0.0)
+            except Exception as api_error2:
+                logger.error(f"DeepInfra API error (pass2): {api_error2}")
+                return Response(
+                    {"error": "Lỗi khi gọi AI service (bổ sung)"},
+                    status=500,
+                )
+
+            text2 = (resp2.choices[0].message.content or "").strip()
+            plan2 = _extract_plan_lines(text2)
+            plan.update(plan2)
+            logger.info(f"After continuation, parsed days: {sorted(plan.keys())}")
+
+        # --------- Hậu kiểm & làm sạch ---------
+        _cleanup_tools(plan)       # chỉ tool ở Ngày 1
+        _enforce_len(plan, 90)     # cảnh báo nếu > 90 ký tự/dòng
+
+        # Nếu vẫn chưa đủ 28 ngày, fallback mặc định
+        if len(plan) != 28:
+            logger.warning(f"Expected 28 days but got {len(plan)}. Fallback default plan.")
+            plan = {}
             for day in range(1, 29):
-                week = (day - 1) // 7 + 1
-                objs.append(
-                    ProgressLog(
+                if day == 1:
+                    line = (
+                        f"Ngày 1: Ôn {subject} cơ bản, đặt mục tiêu {goal} | "
+                        f"TỪ KHÓA: {subject} nhập môn | BT: 15' thực hành | "
+                        f"CÔNG CỤ HỖ TRỢ: Google Classroom"
+                    )
+                elif day == 28:
+                    line = (
+                        f"Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - mục tiêu {goal} | "
+                        f"TỪ KHÓA: đề tổng hợp | BT: đề thử"
+                    )
+                else:
+                    line = (
+                        f"Ngày {day}: Học {subject} theo mục tiêu {goal} | "
+                        f"TỪ KHÓA: {subject} {goal} | BT: 15' thực hành"
+                    )
+                plan[day] = line
+
+        # --------- Lưu DB ---------
+        user = request.user
+        try:
+            with transaction.atomic():
+                deleted = ProgressLog.objects.filter(
+                    user=user,
+                    subject=subject
+                ).delete()[0]
+                logger.info(f"Deleted {deleted} old progress logs")
+
+                objs = []
+                for day in range(1, 29):
+                    week = (day - 1) // 7 + 1
+                    task_text = plan[day]
+                    objs.append(ProgressLog(
                         user=user,
                         subject=subject,
                         week=week,
                         day_number=day,
-                        task_title=plan[day],
+                        task_title=task_text,
                         status="pending",
-                    )
-                )
-            ProgressLog.objects.bulk_create(objs)
+                    ))
+                ProgressLog.objects.bulk_create(objs)
+                logger.info(f"Created {len(objs)} progress logs")
+        except Exception as db_error:
+            logger.error(f"Database error: {db_error}")
+            return Response({"error": "Lỗi lưu dữ liệu vào database"}, status=500)
 
-        logs = ProgressLog.objects.filter(user=user, subject=subject).order_by("week", "day_number")
+        logs = ProgressLog.objects.filter(
+            user=user,
+            subject=subject
+        ).order_by("week", "day_number")
+
+        raw_out = (text1 or "") + ("\n" + text2 if text2 else "")
         return Response(
             {
-                "message": "✅ Đã tạo lộ trình học!",
+                "message": "✅ Đã tạo lộ trình học 28 ngày!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
-                "ai_generated": bool(lines),  # True nếu có ít nhất một dòng từ LLM
-                "note": "Áp dụng prompt skeleton 28 dòng; có lượt bổ sung + fallback an toàn, timeout ngắn.",
+                "raw_gpt_output": raw_out.strip()[:1000],
+                "model": LLM_MODEL,
             },
-            status=status.HTTP_201_CREATED,
+            status=201,
         )
 
-    except Exception as e:
-        logger.exception("Unexpected error in generate_learning_path")
-        return Response({"error": "Lỗi không xác định", "details": str(e)[:200]}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    except Exception as unexpected_error:
+        logger.error(f"Unexpected error in generate_learning_path: {unexpected_error}")
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+        return Response(
+            {"error": "Lỗi không xác định", "details": str(unexpected_error)[:200]},
+            status=500,
+        )
 
-# =====================================================
+# =========================================
 # Get progress list
-# =====================================================
+# =========================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_progress_list(request):
@@ -280,14 +358,14 @@ def get_progress_list(request):
         qs = ProgressLog.objects.filter(user=user).order_by("subject", "week", "day_number")
         if subject:
             qs = qs.filter(subject=subject)
-        return Response(ProgressLogSerializer(qs, many=True).data, status=status.HTTP_200_OK)
+        return Response(ProgressLogSerializer(qs, many=True).data, status=200)
     except Exception as e:
-        logger.exception("Error in get_progress_list: %s", e)
-        return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.error(f"Error in get_progress_list: {e}")
+        return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
 
-# =====================================================
+# =========================================
 # Update progress status
-# =====================================================
+# =========================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_progress_status(request):
@@ -296,27 +374,33 @@ def update_progress_status(request):
         new_status_raw = request.data.get("status")
 
         if not log_id or new_status_raw is None:
-            return Response({"error": "Thiếu thông tin 'id' hoặc 'status'."}, status=status.HTTP_400_BAD_REQUEST)
+            return Response(
+                {"error": "Thiếu thông tin 'id' hoặc 'status'."},
+                status=400,
+            )
 
         try:
             log = ProgressLog.objects.get(id=log_id, user=request.user)
         except ProgressLog.DoesNotExist:
-            return Response({"error": "Không tìm thấy bản ghi của bạn"}, status=status.HTTP_404_NOT_FOUND)
+            return Response(
+                {"error": "Không tìm thấy bản ghi của bạn"},
+                status=404,
+            )
 
         log.status = normalize_status(new_status_raw)
         log.save(update_fields=["status"])
 
         return Response(
             {"message": "Cập nhật trạng thái thành công!", "item": ProgressLogSerializer(log).data},
-            status=status.HTTP_200_OK,
+            status=200,
         )
     except Exception as e:
-        logger.exception("Error in update_progress_status: %s", e)
-        return Response({"error": "Lỗi cập nhật trạng thái"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        logger.error(f"Error in update_progress_status: {e}")
+        return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
 
-# =====================================================
+# =========================================
 # Auth & CSRF endpoints
-# =====================================================
+# =========================================
 @api_view(["GET"])
 @ensure_csrf_cookie
 @permission_classes([AllowAny])
@@ -331,9 +415,9 @@ def register(request):
         user = serializer.save()
         return Response(
             {"message": "Đăng ký thành công!", "user": UserSerializer(user).data},
-            status=status.HTTP_201_CREATED,
+            status=201,
         )
-    return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+    return Response(serializer.errors, status=400)
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
@@ -343,7 +427,7 @@ def login_view(request):
     user = authenticate(request, username=username, password=password)
 
     if not user:
-        return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=status.HTTP_400_BAD_REQUEST)
+        return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
 
     login(request, user)
     return Response({"message": "Đăng nhập thành công!", "username": user.username})
@@ -359,4 +443,4 @@ def logout_view(request):
 def whoami(request):
     if request.user.is_authenticated:
         return Response({"username": request.user.username})
-    return Response({"username": None}, status=status.HTTP_200_OK)
+    return Response({"username": None}, status=200)
