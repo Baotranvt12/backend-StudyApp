@@ -59,12 +59,63 @@ def normalize_status(value: str) -> str:
     v = str(value).strip().lower()
     return "done" if v == "done" else "pending"
 
+# ====== Subject → allowed website whitelist (rút gọn, có thể mở rộng) ======
+SUBJECT_WEBSITES_MAP = {
+    # Tin học / Lập trình / CNTT
+    "tin học": [
+        "cppreference.com",
+        "w3schools.com/cpp",
+        "geeksforgeeks.org",
+        "programiz.com/cpp",
+        "tutorialspoint.com/cplusplus",
+        "codelearn.io",
+        "vietjack.com/tin-hoc"
+    ],
+    # Toán học
+    "toán": [
+        "khanacademy.org/math",
+        "brilliant.org",
+        "vietjack.com/toan",
+        "hoc24.vn",
+    ],
+    # Vật lý
+    "vật lý": [
+        "khanacademy.org/science/physics",
+        "vietjack.com/vat-ly",
+        "hoc24.vn",
+    ],
+    # Hóa học
+    "hóa": [
+        "khanacademy.org/science/chemistry",
+        "vietjack.com/hoa-hoc",
+        "hoc24.vn",
+    ],
+    # Tiếng Anh
+    "tiếng anh": [
+        "cambridgeenglish.org",
+        "ieltsliz.com",
+        "learnenglish.britishcouncil.org",
+        "quizlet.com",
+    ],
+}
+
+def _subject_websites(subject: str):
+    s = (subject or "").strip().lower()
+    # khớp theo khóa bắt đầu
+    for key, lst in SUBJECT_WEBSITES_MAP.items():
+        if key in s:
+            return lst
+    # fallback chung
+    return ["khanacademy.org", "wikipedia.org", "quizlet.com", "vietjack.com"]
+
 # =========================
 # LLM helpers
 # =========================
 LLM_MODEL = DEEPINFRA_MODEL
 DAY_LINE_RE = re.compile(r"^Ngày\s+([1-9]|1\d|2[0-8])\s*:", re.IGNORECASE)
 TOOLS_FIELD_RE = re.compile(r"\|\s*CÔNG CỤ HỖ TRỢ\s*:", re.IGNORECASE)
+WEB_FIELD_RE = re.compile(r"\|\s*TRANG WEB TÌM KIẾM\s*:\s*([^|]+)", re.IGNORECASE)
+DOMAIN_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9\.\-/]+")
 
 def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
     return openai.chat.completions.create(
@@ -94,15 +145,63 @@ def _extract_plan_lines(text: str) -> dict:
 def _missing_days(plan: dict) -> list:
     return [d for d in range(1, 29) if d not in plan]
 
-def _ensure_tools_all_days(plan: dict, subject: str):
+def _cleanup_tools_only_day1(plan: dict):
     """
-    Đảm bảo mọi ngày đều có ' | CÔNG CỤ HỖ TRỢ: ...'.
-    Nếu thiếu, tự động thêm với gợi ý chung theo môn học.
+    Chỉ cho phép 'CÔNG CỤ HỖ TRỢ' ở Ngày 1.
+    Với ngày 2..28, loại bỏ phần ' | CÔNG CỤ HỖ TRỢ: ...' nếu có.
     """
     for d, line in list(plan.items()):
-        if not TOOLS_FIELD_RE.search(line):
-            # thêm một nhánh công cụ tối giản, tránh phá cấu trúc còn lại
-            plan[d] = f"{line} | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+        if d == 1:
+            continue
+        plan[d] = re.sub(
+            r"\s*\|\s*CÔNG CỤ HỖ TRỢ:.*$",
+            "",
+            line,
+            flags=re.IGNORECASE,
+        )
+
+def _normalize_domain_token(token: str) -> str:
+    """
+    Chuẩn hoá token domain/path: bỏ http/https, bỏ khoảng trắng dư, chỉ giữ phần ngắn.
+    """
+    x = (token or "").strip()
+    x = x.replace("http://", "").replace("https://", "")
+    x = x.replace("www.", "")
+    # Lấy token giống domain/path
+    m = DOMAIN_TOKEN_RE.search(x)
+    return m.group(0) if m else ""
+
+def _enforce_subject_websites(plan: dict, subject: str):
+    """
+    Đảm bảo trường 'TRANG WEB TÌM KIẾM' hợp lệ & liên quan môn học:
+    - Nếu thiếu/sai định dạng -> chèn domain mặc định theo môn.
+    - Nếu có nhưng không thuộc whitelist -> thay bằng domain gợi ý đầu tiên.
+    """
+    allowed = _subject_websites(subject)
+    default_site = allowed[0] if allowed else "khanacademy.org"
+
+    for d, line in list(plan.items()):
+        m = WEB_FIELD_RE.search(line)
+        if not m:
+            # không có trường -> thêm ngay trước ' | BT'
+            if " | BT" in line:
+                line = line.replace(" | BT", f" | TRANG WEB TÌM KIẾM: {default_site} | BT")
+            else:
+                line = f"{line} | TRANG WEB TÌM KIẾM: {default_site}"
+            plan[d] = line
+            continue
+
+        raw_site = _normalize_domain_token(m.group(1))
+        if not raw_site:
+            site = default_site
+        else:
+            # so sánh với allowed (bắt đầu bằng hoặc bằng)
+            site = raw_site
+            if not any(site.lower().startswith(aw.lower()) for aw in allowed):
+                site = default_site
+
+        # thay phần site đã chuẩn hoá
+        plan[d] = WEB_FIELD_RE.sub(f" | TRANG WEB TÌM KIẾM: {site}", line)
 
 def _enforce_len(plan: dict, limit=90):
     too_long = [d for d, line in plan.items() if len(line) > limit]
@@ -140,23 +239,33 @@ def generate_learning_path(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # --------- Prompt + skeleton: NGÀY NÀO CŨNG CÓ CÔNG CỤ HỖ TRỢ ---------
+        # --------- Prompt chặt chẽ ---------
+        allowed_sites = _subject_websites(subject)
+        sites_str = ", ".join(allowed_sites)
+
         system_msg = (
             "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt. "
             "PHẢI in đúng 28 dòng từ 'Ngày 1:' đến 'Ngày 28:'; mỗi dòng ≤ 90 ký tự; "
             "không tiêu đề/markdown; không dòng trống; mỗi số ngày dùng đúng 1 lần; "
-            "không thêm mô tả ngoài 28 dòng."
+            "không thêm mô tả ngoài 28 dòng. "
+            "Trong trường 'TRANG WEB TÌM KIẾM', chỉ ghi tên miền/ngắn (không http/https, không www.) "
+            f"và CHỈ chọn từ danh sách sau: {sites_str}."
         )
 
+        # Skeleton: mọi ngày có TRANG WEB TÌM KIẾM; CHỈ Ngày 1 có CÔNG CỤ HỖ TRỢ
         skeleton = []
         for d in range(1, 29):
-            if d == 28:
+            if d == 1:
                 skeleton.append(
-                    "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                    f"Ngày {d}: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                )
+            elif d == 28:
+                skeleton.append(
+                    "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TRANG WEB TÌM KIẾM: <domain> | BT: <đề thử>"
                 )
             else:
                 skeleton.append(
-                    f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                    f"Ngày {d}: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý>"
                 )
         skeleton_text = "\n".join(skeleton)
 
@@ -166,7 +275,8 @@ Bám CT GDPT 2018, tăng dần độ khó, không gộp 2 ngày vào 1.
 
 Hãy THAY THẾ các <...> trong KHUNG sau và GIỮ NGUYÊN tiền tố "Ngày N:".
 Nếu thiếu dòng nào, tự bổ sung đến đủ 28 dòng.
-Mọi ngày (1–28) đều PHẢI có ' | CÔNG CỤ HỖ TRỢ: ... '.
+CHỈ Ngày 1 có 'CÔNG CỤ HỖ TRỢ'. Các ngày 2–28 KHÔNG có mục này.
+'TRANG WEB TÌM KIẾM' bắt buộc chọn 1 trong: {sites_str}. Ghi dưới dạng tên miền ngắn (vd: cppreference.com).
 
 {skeleton_text}
 
@@ -212,13 +322,17 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
             cont_lines = []
             cont_prompt = "In TIẾP đúng các dòng còn thiếu (không lặp, không giải thích):\n"
             for d in missing:
-                if d == 28:
+                if d == 1:
                     cont_lines.append(
-                        "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TỪ KHÓA: <từ khóa> | BT: <đề thử> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                        f"Ngày 1: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                    )
+                elif d == 28:
+                    cont_lines.append(
+                        "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TRANG WEB TÌM KIẾM: <domain> | BT: <đề thử>"
                     )
                 else:
                     cont_lines.append(
-                        f"Ngày {d}: <nội dung ngắn> | TỪ KHÓA: <từ khóa> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                        f"Ngày {d}: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý>"
                     )
             cont_prompt += "\n".join(cont_lines)
 
@@ -241,26 +355,33 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
             plan.update(plan2)
             logger.info(f"After continuation, parsed days: {sorted(plan.keys())}")
 
-        # --------- Hậu kiểm & đảm bảo đủ trường Công cụ ---------
-        _ensure_tools_all_days(plan, subject)
-        _enforce_len(plan, 90)
+        # --------- Hậu kiểm ---------
+        _cleanup_tools_only_day1(plan)       # chỉ Ngày 1 có công cụ hỗ trợ
+        _enforce_subject_websites(plan, subject)  # web tìm kiếm liên quan môn
+        _enforce_len(plan, 90)               # cảnh báo nếu > 90 ký tự/dòng
 
-        # Nếu vẫn chưa đủ 28 ngày, fallback mặc định (có CÔNG CỤ HỖ TRỢ)
+        # Nếu vẫn chưa đủ 28 ngày, fallback mặc định
         if len(plan) != 28:
             logger.warning(f"Expected 28 days but got {len(plan)}. Fallback default plan.")
+            allowed = _subject_websites(subject)
+            default_site = allowed[0] if allowed else "khanacademy.org"
             plan = {}
             for day in range(1, 29):
-                if day == 28:
+                if day == 1:
+                    line = (
+                        f"Ngày 1: Ôn {subject} cơ bản, đặt mục tiêu {goal} | "
+                        f"TRANG WEB TÌM KIẾM: {default_site} | BT: 15' thực hành | "
+                        f"CÔNG CỤ HỖ TRỢ: Google Classroom"
+                    )
+                elif day == 28:
                     line = (
                         f"Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - mục tiêu {goal} | "
-                        f"TỪ KHÓA: đề tổng hợp | BT: đề thử | "
-                        f"CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                        f"TRANG WEB TÌM KIẾM: {default_site} | BT: đề thử"
                     )
                 else:
                     line = (
                         f"Ngày {day}: Học {subject} theo mục tiêu {goal} | "
-                        f"TỪ KHÓA: {subject} {goal} | BT: 15' thực hành | "
-                        f"CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                        f"TRANG WEB TÌM KIẾM: {default_site} | BT: 15' thực hành"
                     )
                 plan[day] = line
 
@@ -300,7 +421,7 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
         raw_out = (text1 or "") + ("\n" + text2 if text2 else "")
         return Response(
             {
-                "message": "✅ Đã tạo lộ trình học 28 ngày (có CÔNG CỤ HỖ TRỢ mỗi ngày)!",
+                "message": "✅ Đã tạo lộ trình học 28 ngày!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
                 "raw_gpt_output": raw_out.strip()[:1000],
