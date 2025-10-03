@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import logging
 
 from django.db import transaction
@@ -59,63 +60,12 @@ def normalize_status(value: str) -> str:
     v = str(value).strip().lower()
     return "done" if v == "done" else "pending"
 
-# ====== Subject → allowed website whitelist (rút gọn, có thể mở rộng) ======
-SUBJECT_WEBSITES_MAP = {
-    # Tin học / Lập trình / CNTT
-    "tin học": [
-        "cppreference.com",
-        "w3schools.com/cpp",
-        "geeksforgeeks.org",
-        "programiz.com/cpp",
-        "tutorialspoint.com/cplusplus",
-        "codelearn.io",
-        "vietjack.com/tin-hoc"
-    ],
-    # Toán học
-    "toán": [
-        "khanacademy.org/math",
-        "brilliant.org",
-        "vietjack.com/toan",
-        "hoc24.vn",
-    ],
-    # Vật lý
-    "vật lý": [
-        "khanacademy.org/science/physics",
-        "vietjack.com/vat-ly",
-        "hoc24.vn",
-    ],
-    # Hóa học
-    "hóa": [
-        "khanacademy.org/science/chemistry",
-        "vietjack.com/hoa-hoc",
-        "hoc24.vn",
-    ],
-    # Tiếng Anh
-    "tiếng anh": [
-        "cambridgeenglish.org",
-        "ieltsliz.com",
-        "learnenglish.britishcouncil.org",
-        "quizlet.com",
-    ],
-}
-
-def _subject_websites(subject: str):
-    s = (subject or "").strip().lower()
-    # khớp theo khóa bắt đầu
-    for key, lst in SUBJECT_WEBSITES_MAP.items():
-        if key in s:
-            return lst
-    # fallback chung
-    return ["khanacademy.org", "wikipedia.org", "quizlet.com", "vietjack.com"]
-
 # =========================
-# LLM helpers
+# LLM helpers (JSON Lines)
 # =========================
 LLM_MODEL = DEEPINFRA_MODEL
-DAY_LINE_RE = re.compile(r"^Ngày\s+([1-9]|1\d|2[0-8])\s*:", re.IGNORECASE)
-TOOLS_FIELD_RE = re.compile(r"\|\s*CÔNG CỤ HỖ TRỢ\s*:", re.IGNORECASE)
-WEB_FIELD_RE = re.compile(r"\|\s*TRANG WEB TÌM KIẾM\s*:\s*([^|]+)", re.IGNORECASE)
 DOMAIN_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9\.\-/]+")
+FALLBACK_DOMAIN = "khanacademy.org"  # fallback chung khi thiếu/không hợp lệ
 
 def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
     return openai.chat.completions.create(
@@ -125,88 +75,56 @@ def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
         max_tokens=max_tokens,
         temperature=temperature,
         top_p=1,
-        stop=stop or ["\nNgày 29", "Ngày 29:"],
+        stop=stop or [],  # JSONL không cần stop "Ngày 29"
     )
-
-def _extract_plan_lines(text: str) -> dict:
-    plan = {}
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = DAY_LINE_RE.match(line)
-        if not m:
-            continue
-        day = int(m.group(1))
-        if 1 <= day <= 28:
-            plan[day] = line
-    return plan
-
-def _missing_days(plan: dict) -> list:
-    return [d for d in range(1, 29) if d not in plan]
-
-def _cleanup_tools_only_day1(plan: dict):
-    """
-    Chỉ cho phép 'CÔNG CỤ HỖ TRỢ' ở Ngày 1.
-    Với ngày 2..28, loại bỏ phần ' | CÔNG CỤ HỖ TRỢ: ...' nếu có.
-    """
-    for d, line in list(plan.items()):
-        if d == 1:
-            continue
-        plan[d] = re.sub(
-            r"\s*\|\s*CÔNG CỤ HỖ TRỢ:.*$",
-            "",
-            line,
-            flags=re.IGNORECASE,
-        )
 
 def _normalize_domain_token(token: str) -> str:
     """
-    Chuẩn hoá token domain/path: bỏ http/https, bỏ khoảng trắng dư, chỉ giữ phần ngắn.
+    Chuẩn hoá domain/path: bỏ http/https, bỏ www., loại bỏ khoảng trắng, lấy phần gọn.
     """
     x = (token or "").strip()
     x = x.replace("http://", "").replace("https://", "")
     x = x.replace("www.", "")
-    # Lấy token giống domain/path
+    x = x.split()[0]  # lấy token đầu nếu ai đó chèn khoảng trắng
     m = DOMAIN_TOKEN_RE.search(x)
     return m.group(0) if m else ""
 
-def _enforce_subject_websites(plan: dict, subject: str):
+def _ensure_keyword_domain(obj: dict):
     """
-    Đảm bảo trường 'TRANG WEB TÌM KIẾM' hợp lệ & liên quan môn học:
-    - Nếu thiếu/sai định dạng -> chèn domain mặc định theo môn.
-    - Nếu có nhưng không thuộc whitelist -> thay bằng domain gợi ý đầu tiên.
+    Đảm bảo obj['keyword'] là domain ngắn. Nếu thiếu/không hợp lệ → dùng FALLBACK_DOMAIN.
     """
-    allowed = _subject_websites(subject)
-    default_site = allowed[0] if allowed else "khanacademy.org"
+    raw_site = _normalize_domain_token(obj.get("keyword") or "")
+    # loại trường hợp quá dài/lạc đề bằng một check nhẹ
+    if not raw_site or len(raw_site) > 60 or "/" in raw_site and len(raw_site) > 40:
+        obj["keyword"] = FALLBACK_DOMAIN
+    else:
+        obj["keyword"] = raw_site
 
-    for d, line in list(plan.items()):
-        m = WEB_FIELD_RE.search(line)
-        if not m:
-            # không có trường -> thêm ngay trước ' | BT'
-            if " | BT" in line:
-                line = line.replace(" | BT", f" | TRANG WEB TÌM KIẾM: {default_site} | BT")
-            else:
-                line = f"{line} | TRANG WEB TÌM KIẾM: {default_site}"
-            plan[d] = line
-            continue
+def _ensure_tool_only_day1(obj: dict, day: int, subject: str):
+    """Chỉ Ngày 1 có tool. Các ngày khác set tool=None."""
+    if day == 1:
+        t = (obj.get("tool") or "").strip()
+        if not t:
+            obj["tool"] = f"Google Classroom (môn {subject})"
+    else:
+        obj["tool"] = None
 
-        raw_site = _normalize_domain_token(m.group(1))
-        if not raw_site:
-            site = default_site
-        else:
-            # so sánh với allowed (bắt đầu bằng hoặc bằng)
-            site = raw_site
-            if not any(site.lower().startswith(aw.lower()) for aw in allowed):
-                site = default_site
+def _shorten(text: str, limit: int = 60) -> str:
+    """Rút gọn chuỗi để giữ tổng JSON line ngắn (ưu tiên content/exercise)."""
+    t = (text or "").strip()
+    return t if len(t) <= limit else (t[:limit - 1] + "…")
 
-        # thay phần site đã chuẩn hoá
-        plan[d] = WEB_FIELD_RE.sub(f" | TRANG WEB TÌM KIẾM: {site}", line)
-
-def _enforce_len(plan: dict, limit=90):
-    too_long = [d for d, line in plan.items() if len(line) > limit]
-    if too_long:
-        logger.warning(f"Có {len(too_long)} dòng vượt {limit} ký tự: {too_long}")
+def _make_task_title(day: int, obj: dict) -> str:
+    """Ghép thành 1 dòng text để lưu vào task_title (ngắn gọn)."""
+    parts = [f"Ngày {day}", f"Nội dung: {obj.get('content','').strip()}"]
+    if obj.get("keyword"):
+        parts.append(f"Web: {obj['keyword']}")
+    if obj.get("exercise"):
+        parts.append(f"BT: {obj['exercise']}")
+    if day == 1 and obj.get("tool"):
+        parts.append(f"Tool: {obj['tool']}")
+    title = " | ".join(parts)
+    return title if len(title) <= 120 else (title[:119] + "…")
 
 # =========================================
 # Generate learning path (store per-user)
@@ -239,48 +157,55 @@ def generate_learning_path(request):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # --------- Prompt chặt chẽ ---------
-        allowed_sites = _subject_websites(subject)
-        sites_str = ", ".join(allowed_sites)
-
+        # --------- Prompt JSONL (không whitelist) ---------
+        # Nói rõ keyword phải là domain ngắn, liên quan môn (mô tả), ưu tiên học liệu; cho ví dụ—không ràng buộc
+        examples = "ví dụ: khanacademy.org, vietjack.com, cppreference.com, britannica.com"
         system_msg = (
-            "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt. "
-            "PHẢI in đúng 28 dòng từ 'Ngày 1:' đến 'Ngày 28:'; mỗi dòng ≤ 90 ký tự; "
-            "không tiêu đề/markdown; không dòng trống; mỗi số ngày dùng đúng 1 lần; "
-            "không thêm mô tả ngoài 28 dòng. "
-            "Trong trường 'TRANG WEB TÌM KIẾM', chỉ ghi tên miền/ngắn (không http/https, không www.) "
-            f"và CHỈ chọn từ danh sách sau: {sites_str}."
+            "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt.\n"
+            "YÊU CẦU ĐẦU RA (BẮT BUỘC):\n"
+            "• In CHÍNH XÁC 28 dòng JSON (mỗi dòng 1 object, không mảng, không giải thích).\n"
+            "• Mỗi object có khóa: day (int 1..28), content (string ≤ 60 ký tự), "
+            "keyword (string – TÊN MIỀN trang web ngắn), exercise (string ≤ 60 ký tự), tool (string | null).\n"
+            "• Chỉ Ngày 1 có tool (ghi tên ứng dụng/công cụ), ngày 2..28 để tool = null hoặc bỏ field.\n"
+            "• keyword PHẢI là TÊN MIỀN NGẮN (không http/https/www), liên quan trực tiếp tới môn học, "
+            f"ưu tiên trang học liệu uy tín ({examples}).\n"
+            "• Không in tiêu đề/markdown, không dòng trống, không text thừa ngoài 28 dòng JSON.\n"
         )
 
-        # Skeleton: mọi ngày có TRANG WEB TÌM KIẾM; CHỈ Ngày 1 có CÔNG CỤ HỖ TRỢ
-        skeleton = []
+        # Skeleton JSON Lines (28 dòng)
+        sk_lines = []
         for d in range(1, 29):
             if d == 1:
-                skeleton.append(
-                    f"Ngày {d}: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                sk_lines.append(
+                    '{"day": 1, "content": "<nội dung>", "keyword": "<domain>", '
+                    f'"exercise": "<bài tập>", "tool": "<app môn {subject}>"}'
                 )
             elif d == 28:
-                skeleton.append(
-                    "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TRANG WEB TÌM KIẾM: <domain> | BT: <đề thử>"
+                sk_lines.append(
+                    '{"day": 28, "content": "Ôn & kiểm tra tổng hợp - <tóm tắt>", '
+                    '"keyword": "<domain>", "exercise": "<đề thử>"}'
                 )
             else:
-                skeleton.append(
-                    f"Ngày {d}: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý>"
+                sk_lines.append(
+                    f'{{"day": {d}, "content": "<nội dung>", "keyword": "<domain>", '
+                    '"exercise": "<bài tập>"}}'
                 )
-        skeleton_text = "\n".join(skeleton)
+        skeleton_text = "\n".join(sk_lines)
 
         user_msg = f"""
-Học sinh lớp {class_level}, môn {subject}, thời lượng {study_time}/ngày. Mục tiêu: {goal}.
+Học sinh lớp {class_level}, môn {subject}, học {study_time}/ngày. Mục tiêu: {goal}.
 Bám CT GDPT 2018, tăng dần độ khó, không gộp 2 ngày vào 1.
 
-Hãy THAY THẾ các <...> trong KHUNG sau và GIỮ NGUYÊN tiền tố "Ngày N:".
-Nếu thiếu dòng nào, tự bổ sung đến đủ 28 dòng.
-CHỈ Ngày 1 có 'CÔNG CỤ HỖ TRỢ'. Các ngày 2–28 KHÔNG có mục này.
-'TRANG WEB TÌM KIẾM' bắt buộc chọn 1 trong: {sites_str}. Ghi dưới dạng tên miền ngắn (vd: cppreference.com).
+Hãy THAY THẾ các <...> trong KHUNG JSONLINES sau. 
+Ràng buộc:
+- keyword: TÊN MIỀN NGẮN, liên quan tới môn {subject}, không http/https/www (vd: khanacademy.org).
+- tool: chỉ Ngày 1 có; các ngày khác để null hoặc bỏ field.
+- Ưu tiên rút gọn content & exercise để mỗi dòng ngắn gọn (~≤ 90 ký tự tổng thể).
 
+KHUNG (28 dòng, từ day=1 đến day=28):
 {skeleton_text}
 
-Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
+Chỉ in đúng 28 dòng JSON như KHUNG, không in gì khác.
 """.strip()
 
         messages = [
@@ -288,7 +213,7 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
             {"role": "user",   "content": user_msg},
         ]
 
-        # --------- Lần gọi 1 ---------
+        # --------- Gọi LLM lần 1 ---------
         logger.info(f"Calling DeepInfra model={LLM_MODEL} (first pass)…")
         try:
             resp = _llm_call(messages, temperature=0.0)
@@ -296,94 +221,94 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
             logger.error(f"DeepInfra API error (pass1): {api_error}")
             err = str(api_error).lower()
             if "api_key" in err:
-                return Response(
-                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."},
-                    status=500,
-                )
+                return Response({"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."}, status=500)
             if "rate" in err:
-                return Response(
-                    {"error": "Đã vượt giới hạn API. Vui lòng thử lại sau."},
-                    status=429,
-                )
-            return Response(
-                {"error": "Lỗi khi gọi AI service", "details": str(api_error)[:200]},
-                status=500,
-            )
+                return Response({"error": "Đã vượt giới hạn API. Vui lòng thử lại sau."}, status=429)
+            return Response({"error": "Lỗi khi gọi AI service", "details": str(api_error)[:200]}, status=500)
 
         text1 = (resp.choices[0].message.content or "").strip()
-        plan = _extract_plan_lines(text1)
-        logger.info(f"Pass1 parsed days: {sorted(plan.keys())}")
+        lines1 = [ln for ln in text1.splitlines() if ln.strip()]
+        logger.info(f"First pass lines: {len(lines1)}")
 
-        # --------- Nếu thiếu ngày, gọi tiếp để in nốt phần còn thiếu ---------
+        # Parse JSON Lines → dict day->obj
+        plan_objs = {}
+        for ln in lines1:
+            try:
+                obj = json.loads(ln)
+                d = int(obj.get("day", 0))
+                if 1 <= d <= 28:
+                    plan_objs[d] = obj
+            except Exception:
+                continue
+
+        # --------- Nếu thiếu, yêu cầu in tiếp các day còn thiếu dưới dạng JSONL ---------
+        missing = [d for d in range(1, 29) if d not in plan_objs]
         text2 = ""
-        missing = _missing_days(plan)
         if missing:
             logger.warning(f"Missing days after pass1: {missing}")
-            cont_lines = []
-            cont_prompt = "In TIẾP đúng các dòng còn thiếu (không lặp, không giải thích):\n"
+            sk2 = []
             for d in missing:
                 if d == 1:
-                    cont_lines.append(
-                        f"Ngày 1: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý> | CÔNG CỤ HỖ TRỢ: <app môn {subject}>"
+                    sk2.append(
+                        '{"day": 1, "content": "<nội dung>", "keyword": "<domain>", '
+                        f'"exercise": "<bài tập>", "tool": "<app môn {subject}>"}'
                     )
                 elif d == 28:
-                    cont_lines.append(
-                        "Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - <tóm tắt mục tiêu> | TRANG WEB TÌM KIẾM: <domain> | BT: <đề thử>"
+                    sk2.append(
+                        '{"day": 28, "content": "Ôn & kiểm tra tổng hợp - <tóm tắt>", '
+                        '"keyword": "<domain>", "exercise": "<đề thử>"}'
                     )
                 else:
-                    cont_lines.append(
-                        f"Ngày {d}: <nội dung ngắn> | TRANG WEB TÌM KIẾM: <domain> | BT: <gợi ý>"
+                    sk2.append(
+                        f'{{"day": {d}, "content": "<nội dung>", "keyword": "<domain>", '
+                        '"exercise": "<bài tập>"}}'
                     )
-            cont_prompt += "\n".join(cont_lines)
-
+            cont_prompt = (
+                "In TIẾP đúng các dòng JSON còn thiếu, MỖI DÒNG 1 OBJECT, không giải thích, không mảng:\n" +
+                "\n".join(sk2)
+            )
             messages2 = [
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": cont_prompt},
             ]
             logger.info("Calling DeepInfra (continuation)…")
             try:
-                resp2 = _llm_call(messages2, max_tokens=800, temperature=0.0)
+                resp2 = _llm_call(messages2, max_tokens=1200, temperature=0.0)
             except Exception as api_error2:
                 logger.error(f"DeepInfra API error (pass2): {api_error2}")
-                return Response(
-                    {"error": "Lỗi khi gọi AI service (bổ sung)"},
-                    status=500,
-                )
+                return Response({"error": "Lỗi khi gọi AI service (bổ sung)"}, status=500)
 
             text2 = (resp2.choices[0].message.content or "").strip()
-            plan2 = _extract_plan_lines(text2)
-            plan.update(plan2)
-            logger.info(f"After continuation, parsed days: {sorted(plan.keys())}")
+            lines2 = [ln for ln in text2.splitlines() if ln.strip()]
+            for ln in lines2:
+                try:
+                    obj = json.loads(ln)
+                    d = int(obj.get("day", 0))
+                    if 1 <= d <= 28:
+                        plan_objs[d] = obj
+                except Exception:
+                    continue
 
-        # --------- Hậu kiểm ---------
-        _cleanup_tools_only_day1(plan)       # chỉ Ngày 1 có công cụ hỗ trợ
-        _enforce_subject_websites(plan, subject)  # web tìm kiếm liên quan môn
-        _enforce_len(plan, 90)               # cảnh báo nếu > 90 ký tự/dòng
+        # --------- Hậu kiểm & chuẩn hoá từng object ---------
+        for d in range(1, 29):
+            if d not in plan_objs:
+                # tạo object tối thiểu nếu vẫn thiếu
+                plan_objs[d] = {
+                    "day": d,
+                    "content": f"Học {subject} theo mục tiêu {goal}",
+                    "keyword": FALLBACK_DOMAIN,
+                    "exercise": "15' thực hành",
+                    "tool": f"Google Classroom (môn {subject})" if d == 1 else None
+                }
 
-        # Nếu vẫn chưa đủ 28 ngày, fallback mặc định
-        if len(plan) != 28:
-            logger.warning(f"Expected 28 days but got {len(plan)}. Fallback default plan.")
-            allowed = _subject_websites(subject)
-            default_site = allowed[0] if allowed else "khanacademy.org"
-            plan = {}
-            for day in range(1, 29):
-                if day == 1:
-                    line = (
-                        f"Ngày 1: Ôn {subject} cơ bản, đặt mục tiêu {goal} | "
-                        f"TRANG WEB TÌM KIẾM: {default_site} | BT: 15' thực hành | "
-                        f"CÔNG CỤ HỖ TRỢ: Google Classroom"
-                    )
-                elif day == 28:
-                    line = (
-                        f"Ngày 28: ÔN & KIỂM TRA TỔNG HỢP - mục tiêu {goal} | "
-                        f"TRANG WEB TÌM KIẾM: {default_site} | BT: đề thử"
-                    )
-                else:
-                    line = (
-                        f"Ngày {day}: Học {subject} theo mục tiêu {goal} | "
-                        f"TRANG WEB TÌM KIẾM: {default_site} | BT: 15' thực hành"
-                    )
-                plan[day] = line
+            # rút gọn content/exercise để ngắn gọn
+            plan_objs[d]["content"]  = _shorten(plan_objs[d].get("content", ""), 60)
+            plan_objs[d]["exercise"] = _shorten(plan_objs[d].get("exercise", ""), 60)
+
+            # chuẩn hoá domain keyword (không dùng whitelist)
+            _ensure_keyword_domain(plan_objs[d])
+            # chỉ ngày 1 có tool
+            _ensure_tool_only_day1(plan_objs[d], d, subject)
 
         # --------- Lưu DB ---------
         user = request.user
@@ -397,14 +322,14 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
 
                 objs = []
                 for day in range(1, 29):
+                    title = _make_task_title(day, plan_objs[day])
                     week = (day - 1) // 7 + 1
-                    task_text = plan[day]
                     objs.append(ProgressLog(
                         user=user,
                         subject=subject,
                         week=week,
                         day_number=day,
-                        task_title=task_text,
+                        task_title=title,   # gộp ngắn gọn; tùy bạn mở rộng model để lưu 4 field
                         status="pending",
                     ))
                 ProgressLog.objects.bulk_create(objs)
@@ -421,10 +346,10 @@ Chỉ in đúng 28 dòng ở trên, không thêm nội dung khác.
         raw_out = (text1 or "") + ("\n" + text2 if text2 else "")
         return Response(
             {
-                "message": "✅ Đã tạo lộ trình học 28 ngày!",
+                "message": "✅ Đã tạo lộ trình học 28 ngày (JSONL, không whitelist)!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
-                "raw_gpt_output": raw_out.strip()[:1000],
+                "raw_gpt_output": raw_out.strip()[:1200],
                 "model": LLM_MODEL,
             },
             status=201,
