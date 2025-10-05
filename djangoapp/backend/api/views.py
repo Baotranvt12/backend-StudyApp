@@ -1,12 +1,13 @@
 import os
 import re
-import json
 import logging
+import traceback
+from typing import Dict, List
 
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
-from django.contrib.auth.models import User
 from django.views.decorators.csrf import ensure_csrf_cookie
+from django.contrib.auth.models import User
 
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
@@ -22,20 +23,25 @@ from .serializers import (
     UserSerializer,
 )
 
-# =========================
+# ------------------------------------------------------------------------------
 # Logging
-# =========================
+# ------------------------------------------------------------------------------
 logger = logging.getLogger(__name__)
 
-# =========================
+# ------------------------------------------------------------------------------
 # OpenAI (DeepInfra) client
-# =========================
+# ------------------------------------------------------------------------------
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
-DEEPINFRA_MODEL = os.environ.get("DEEPINFRA_MODEL", "meta-llama/Meta-Llama-3-8B-Instruct")
+
+logger.info(f"DEEPINFRA_API_KEY exists: {bool(DEEPINFRA_API_KEY)}")
+if DEEPINFRA_API_KEY:
+    logger.info(f"API Key length: {len(DEEPINFRA_API_KEY)}")
+    logger.info(f"API Key first 10 chars: {DEEPINFRA_API_KEY[:10]}...")
 
 if not DEEPINFRA_API_KEY:
+    logger.error("DEEPINFRA_API_KEY environment variable is not set!")
     if os.environ.get("DJANGO_DEBUG", "false").lower() == "true":
-        logger.warning("DEEPINFRA_API_KEY is missing. Using a placeholder for development only!")
+        logger.warning("Using default API key for development only!")
         DEEPINFRA_API_KEY = "your_development_key_here"
     else:
         raise ValueError("DEEPINFRA_API_KEY environment variable is required in production")
@@ -45,100 +51,134 @@ try:
         api_key=DEEPINFRA_API_KEY,
         base_url="https://api.deepinfra.com/v1/openai",
     )
-    logger.info("OpenAI client initialized successfully.")
+    logger.info("OpenAI client initialized successfully")
 except Exception as e:
     logger.error(f"Failed to initialize OpenAI client: {e}")
     raise
 
-# =========================
+# ------------------------------------------------------------------------------
 # Helpers
-# =========================
+# ------------------------------------------------------------------------------
 def normalize_status(value: str) -> str:
-    """Normalize arbitrary status strings into 'pending' or 'done'."""
+    """Chuẩn hoá status bất kỳ về 'pending' hoặc 'done'."""
     if not value:
         return "pending"
-    v = str(value).strip().lower()
+    v = value.strip().lower()
     return "done" if v == "done" else "pending"
 
-# =========================
-# LLM helpers (JSON Lines)
-# =========================
-LLM_MODEL = DEEPINFRA_MODEL
-DOMAIN_TOKEN_RE = re.compile(r"[a-zA-Z0-9][a-zA-Z0-9\.\-/]+")
-FALLBACK_DOMAIN = "khanacademy.org"  # fallback chung khi thiếu/không hợp lệ
 
-def _llm_call(messages, max_tokens=2000, temperature=0.0, stop=None):
-    return openai.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        stream=False,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        top_p=1,
-        stop=stop or [],  # JSONL không cần stop "Ngày 29"
-    )
-
-def _normalize_domain_token(token: str) -> str:
+def build_prompt_vi(class_level: str, subject: str, study_time: str, goal: str) -> List[Dict[str, str]]:
     """
-    Chuẩn hoá domain/path: bỏ http/https, bỏ www., loại bỏ khoảng trắng, lấy phần gọn.
+    Tạo prompt tiếng Việt, ép LLM trả về 28 dòng đúng format.
+    Mỗi dòng gồm: Tiêu đề, Kỹ năng, Hoạt động (bài tập/project/tài liệu), Tài nguyên, Tự kiểm.
+    Ngày 28 bắt buộc có rubric/checklist chi tiết.
     """
-    x = (token or "").strip()
-    x = x.replace("http://", "").replace("https://", "")
-    x = x.replace("www.", "")
-    x = x.split()[0]  # lấy token đầu nếu ai đó chèn khoảng trắng
-    m = DOMAIN_TOKEN_RE.search(x)
-    return m.group(0) if m else ""
+    user_content = f"""
+Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}.
+Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
 
-def _ensure_keyword_domain(obj: dict):
+YÊU CẦU BẮT BUỘC:
+- Theo chương trình Giáo dục phổ thông 2018 (Bộ GD&ĐT), đi từ cơ bản đến nâng cao.
+- Xuất RA CHÍNH XÁC 28 DÒNG, tương ứng Ngày 1 → Ngày 28.
+- KHÔNG thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
+- MỖI DÒNG PHẢI THEO ĐÚNG ĐỊNH DẠNG:
+
+Ngày N | Tiêu đề: <tiêu đề ngắn> | Kỹ năng: <kiến thức/kỹ năng cần đạt> | Hoạt động: <bài tập cụ thể / project nhỏ / nguồn tài liệu cần đọc/xem> | Tài nguyên: <sách/trang web/khóa học/công cụ> | Tự kiểm: <cách tự kiểm (Ngày 28: viết RUBRIC/Checklist chi tiết: tiêu chí, trọng số, thang điểm, ngưỡng đạt; Ngày 1–27: viết 1 câu tự kiểm ngắn)>
+
+- Ngày 28 bắt buộc có nội dung "ÔN TẬP & KIỂM TRA TỔNG HỢP" trong Tiêu đề và phần Tự kiểm phải là rubric/checklist chi tiết (tiêu chí, trọng số, thang điểm, ngưỡng đạt).
+- Chỉ in đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
+"""
+    return [
+        {
+            "role": "system",
+            "content": (
+                "Bạn là chuyên gia lập kế hoạch tự học (10+ năm kinh nghiệm) thiết kế lộ trình cá nhân hoá. "
+                "Trả lời HOÀN TOÀN bằng tiếng Việt, tuân thủ chặt chẽ định dạng yêu cầu."
+            ),
+        },
+        {
+            "role": "user",
+            "content": user_content.strip(),
+        },
+    ]
+
+
+# Regex bắt đúng đủ 6 trường, phân tách bằng " | "
+LINE_REGEX = re.compile(
+    r"^Ngày\s+(?P<day>\d{1,2})\s*\|\s*Tiêu đề:\s*(?P<title>[^|]+)\|\s*Kỹ năng:\s*(?P<skills>[^|]+)\|\s*Hoạt động:\s*(?P<activities>[^|]+)\|\s*Tài nguyên:\s*(?P<resources>[^|]+)\|\s*Tự kiểm:\s*(?P<selfcheck>.+)$",
+    re.IGNORECASE
+)
+
+
+def parse_plan_lines(text: str) -> Dict[int, str]:
     """
-    Đảm bảo obj['keyword'] là domain ngắn. Nếu thiếu/không hợp lệ → dùng FALLBACK_DOMAIN.
+    Parse 28 dòng theo format cố định. Lưu cả dòng gốc để hiển thị nguyên bản.
+    Trả về dict {day_number: full_line}.
     """
-    raw_site = _normalize_domain_token(obj.get("keyword") or "")
-    # loại trường hợp quá dài/lạc đề bằng một check nhẹ
-    if not raw_site or len(raw_site) > 60 or "/" in raw_site and len(raw_site) > 40:
-        obj["keyword"] = FALLBACK_DOMAIN
-    else:
-        obj["keyword"] = raw_site
+    plan: Dict[int, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        m = LINE_REGEX.match(line)
+        if not m:
+            # Bỏ các dòng không đúng định dạng
+            continue
+        try:
+            day = int(m.group("day"))
+        except Exception:
+            continue
+        if 1 <= day <= 28:
+            plan[day] = line
+    return plan
 
-def _ensure_tool_only_day1(obj: dict, day: int, subject: str):
-    """Chỉ Ngày 1 có tool. Các ngày khác set tool=None."""
-    if day == 1:
-        t = (obj.get("tool") or "").strip()
-        if not t:
-            obj["tool"] = f"Google Classroom (môn {subject})"
-    else:
-        obj["tool"] = None
 
-def _shorten(text: str, limit: int = 60) -> str:
-    """Rút gọn chuỗi để giữ tổng JSON line ngắn (ưu tiên content/exercise)."""
-    t = (text or "").strip()
-    return t if len(t) <= limit else (t[:limit - 1] + "…")
+def ensure_day28_has_rubric(full_line: str) -> bool:
+    """
+    Kiểm tra dòng Ngày 28 có chứa rubric/checklist (dựa theo từ khoá).
+    """
+    text = full_line.lower()
+    keywords = ["rubric", "checklist", "tiêu chí", "trọng số", "thang điểm", "ngưỡng"]
+    return any(k in text for k in keywords)
 
-def _make_task_title(day: int, obj: dict) -> str:
-    """Ghép thành 1 dòng text để lưu vào task_title (ngắn gọn)."""
-    parts = [f"Ngày {day}", f"Nội dung: {obj.get('content','').strip()}"]
-    if obj.get("keyword"):
-        parts.append(f"Web: {obj['keyword']}")
-    if obj.get("exercise"):
-        parts.append(f"BT: {obj['exercise']}")
-    if day == 1 and obj.get("tool"):
-        parts.append(f"Tool: {obj['tool']}")
-    title = " | ".join(parts)
-    return title if len(title) <= 120 else (title[:119] + "…")
 
-# =========================================
-# Generate learning path (store per-user)
-# =========================================
+def fallback_plan(subject: str, goal: str) -> Dict[int, str]:
+    """
+    Kế hoạch dự phòng 28 dòng, đúng format để UI/DB không lỗi.
+    """
+    plan = {}
+    for day in range(1, 29):
+        week = (day - 1) // 7 + 1
+        title = "Ôn tập & Kiểm tra tổng hợp" if day == 28 else f"Chủ đề tuần {week}"
+        selfcheck = (
+            "Rubric: Tiêu chí (Hiểu bài 40%, Vận dụng 40%, Trình bày 20%); Thang điểm 10; Ngưỡng đạt ≥7."
+            if day == 28
+            else "Tự đánh giá bằng câu hỏi nhanh 3–5 phút."
+        )
+        plan[day] = (
+            f"Ngày {day} | Tiêu đề: {title} | "
+            f"Kỹ năng: {subject} liên quan đến {goal} | "
+            f"Hoạt động: Thực hành 15–30 phút theo mục tiêu ngày; ghi chép lại khó khăn | "
+            f"Tài nguyên: SGK/Video chính thống; công cụ Google Tài liệu/Slides | "
+            f"Tự kiểm: {selfcheck}"
+        )
+    return plan
+
+
+# ------------------------------------------------------------------------------
+# API: Generate learning path (store per-user)
+# ------------------------------------------------------------------------------
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
     """
     Body JSON:
     {
-      "class_level": "10",
-      "subject": "Tin học",
-      "study_time": "1 giờ",
-      "goal": "Nắm vững Python cơ bản"
+        "class_level": "10",
+        "subject": "Tin học",
+        "study_time": "1 giờ",
+        "goal": "Nắm vững Python cơ bản",
+        "model": "anthropic/claude-4-sonnet"   # (tuỳ chọn) override model
     }
     """
     try:
@@ -147,226 +187,141 @@ def generate_learning_path(request):
 
         data = request.data
         class_level = (data.get("class_level") or "").strip()
-        subject     = (data.get("subject") or "").strip()
-        study_time  = (data.get("study_time") or "").strip()
-        goal        = (data.get("goal") or "").strip()
+        subject = (data.get("subject") or "").strip()
+        study_time = (data.get("study_time") or "").strip()
+        goal = (data.get("goal") or "").strip()
+        # Mặc định dùng Anthropic Claude 4 Sonnet qua DeepInfra (OpenAI-compatible)
+        model = (data.get("model") or "anthropic/claude-4-sonnet").strip()
 
         if not all([class_level, subject, study_time, goal]):
+            logger.warning("Missing required fields")
             return Response(
-                {"error": "Thiếu thông tin bắt buộc."},
+                {"error": "Thiếu thông tin bắt buộc (class_level, subject, study_time, goal)."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # --------- Prompt JSONL (không whitelist) ---------
-        # Nói rõ keyword phải là domain ngắn, liên quan môn (mô tả), ưu tiên học liệu; cho ví dụ—không ràng buộc
-        examples = "ví dụ: khanacademy.org, vietjack.com, cppreference.com, britannica.com"
-        system_msg = (
-            "Bạn là chuyên gia lập kế hoạch tự học. Trả lời 100% tiếng Việt.\n"
-            "YÊU CẦU ĐẦU RA (BẮT BUỘC):\n"
-            "• In CHÍNH XÁC 28 dòng JSON (mỗi dòng 1 object, không mảng, không giải thích).\n"
-            "• Mỗi object có khóa: day (int 1..28), content (string ≤ 60 ký tự), "
-            "keyword (string – TÊN MIỀN trang web ngắn), exercise (string ≤ 60 ký tự), tool (string | null).\n"
-            "• Chỉ Ngày 1 có tool (ghi tên ứng dụng/công cụ), ngày 2..28 để tool = null hoặc bỏ field.\n"
-            "• keyword PHẢI là TÊN MIỀN NGẮN (không http/https/www), liên quan trực tiếp tới môn học, "
-            f"ưu tiên trang học liệu uy tín ({examples}).\n"
-            "• Không in tiêu đề/markdown, không dòng trống, không text thừa ngoài 28 dòng JSON.\n"
-        )
+        messages = build_prompt_vi(class_level, subject, study_time, goal)
 
-        # Skeleton JSON Lines (28 dòng)
-        sk_lines = []
-        for d in range(1, 29):
-            if d == 1:
-                sk_lines.append(
-                    '{"day": 1, "content": "<nội dung>", "keyword": "<domain>", '
-                    f'"exercise": "<bài tập>", "tool": "<app môn {subject}>"}'
+        # Gọi LLM
+        logger.info(f"Calling DeepInfra API with model={model} ...")
+        try:
+            resp = openai.chat.completions.create(
+                model=model,
+                messages=messages,
+                stream=False,
+                max_tokens=2400,  # đủ cho 28 dòng dài
+                temperature=0.5,  # cân bằng tính nhất quán & sáng tạo
+            )
+            logger.info("DeepInfra API call successful")
+        except Exception as api_error:
+            logger.error(f"DeepInfra API error: {str(api_error)}")
+            error_message = str(api_error)
+            if "api_key" in error_message.lower():
+                return Response(
+                    {"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."},
+                    status=500,
                 )
-            elif d == 28:
-                sk_lines.append(
-                    '{"day": 28, "content": "Ôn & kiểm tra tổng hợp - <tóm tắt>", '
-                    '"keyword": "<domain>", "exercise": "<đề thử>"}'
+            elif "rate" in error_message.lower():
+                return Response(
+                    {"error": "Đã vượt quá giới hạn API. Vui lòng thử lại sau."},
+                    status=429,
                 )
             else:
-                sk_lines.append(
-                    f'{{"day": {d}, "content": "<nội dung>", "keyword": "<domain>", '
-                    '"exercise": "<bài tập>"}}'
+                return Response(
+                    {"error": "Lỗi khi gọi AI service", "details": error_message[:200]},
+                    status=500,
                 )
-        skeleton_text = "\n".join(sk_lines)
 
-        user_msg = f"""
-Học sinh lớp {class_level}, môn {subject}, học {study_time}/ngày. Mục tiêu: {goal}.
-Bám CT GDPT 2018, tăng dần độ khó, không gộp 2 ngày vào 1.
-
-Hãy THAY THẾ các <...> trong KHUNG JSONLINES sau. 
-Ràng buộc:
-- keyword: TÊN MIỀN NGẮN, liên quan tới môn {subject}, không http/https/www (vd: khanacademy.org).
-- tool: chỉ Ngày 1 có; các ngày khác để null hoặc bỏ field.
-- Ưu tiên rút gọn content & exercise để mỗi dòng ngắn gọn (~≤ 90 ký tự tổng thể).
-
-KHUNG (28 dòng, từ day=1 đến day=28):
-{skeleton_text}
-
-Chỉ in đúng 28 dòng JSON như KHUNG, không in gì khác.
-""".strip()
-
-        messages = [
-            {"role": "system", "content": system_msg},
-            {"role": "user",   "content": user_msg},
-        ]
-
-        # --------- Gọi LLM lần 1 ---------
-        logger.info(f"Calling DeepInfra model={LLM_MODEL} (first pass)…")
+        # Parse phản hồi
         try:
-            resp = _llm_call(messages, temperature=0.0)
-        except Exception as api_error:
-            logger.error(f"DeepInfra API error (pass1): {api_error}")
-            err = str(api_error).lower()
-            if "api_key" in err:
-                return Response({"error": "Lỗi xác thực API key. Vui lòng kiểm tra cấu hình."}, status=500)
-            if "rate" in err:
-                return Response({"error": "Đã vượt giới hạn API. Vui lòng thử lại sau."}, status=429)
-            return Response({"error": "Lỗi khi gọi AI service", "details": str(api_error)[:200]}, status=500)
+            gpt_text_vi = (resp.choices[0].message.content or "").strip()
+            logger.info(f"GPT response length: {len(gpt_text_vi)}")
+            if not gpt_text_vi:
+                logger.error("Empty response from GPT")
+                return Response({"error": "Không nhận được phản hồi từ AI"}, status=500)
+        except Exception as parse_error:
+            logger.error(f"Error parsing GPT response: {parse_error}")
+            return Response({"error": "Lỗi xử lý phản hồi từ AI"}, status=500)
 
-        text1 = (resp.choices[0].message.content or "").strip()
-        lines1 = [ln for ln in text1.splitlines() if ln.strip()]
-        logger.info(f"First pass lines: {len(lines1)}")
+        # === Parse 28 dòng ===
+        plan = parse_plan_lines(gpt_text_vi)
+        logger.info(f"Parsed {len(plan)} days from GPT response")
 
-        # Parse JSON Lines → dict day->obj
-        plan_objs = {}
-        for ln in lines1:
-            try:
-                obj = json.loads(ln)
-                d = int(obj.get("day", 0))
-                if 1 <= d <= 28:
-                    plan_objs[d] = obj
-            except Exception:
-                continue
-
-        # --------- Nếu thiếu, yêu cầu in tiếp các day còn thiếu dưới dạng JSONL ---------
-        missing = [d for d in range(1, 29) if d not in plan_objs]
-        text2 = ""
-        if missing:
-            logger.warning(f"Missing days after pass1: {missing}")
-            sk2 = []
-            for d in missing:
-                if d == 1:
-                    sk2.append(
-                        '{"day": 1, "content": "<nội dung>", "keyword": "<domain>", '
-                        f'"exercise": "<bài tập>", "tool": "<app môn {subject}>"}'
-                    )
-                elif d == 28:
-                    sk2.append(
-                        '{"day": 28, "content": "Ôn & kiểm tra tổng hợp - <tóm tắt>", '
-                        '"keyword": "<domain>", "exercise": "<đề thử>"}'
+        # Validate 28 ngày
+        if len(plan) != 28:
+            logger.warning(f"Expected 28 days but got {len(plan)}. Fallback to default plan.")
+            plan = fallback_plan(subject, goal)
+        else:
+            # Bảo đảm ngày 28 có rubric/checklist
+            if 28 not in plan or not ensure_day28_has_rubric(plan[28]):
+                logger.warning("Day 28 missing detailed rubric. Injecting safe rubric.")
+                line28 = plan.get(28, "")
+                if line28:
+                    plan[28] = (
+                        line28.strip()
+                        + " (Rubric: Tiêu chí Hiểu bài 40%, Vận dụng 40%, Trình bày 20%; Thang điểm 10; Ngưỡng đạt ≥7)"
                     )
                 else:
-                    sk2.append(
-                        f'{{"day": {d}, "content": "<nội dung>", "keyword": "<domain>", '
-                        '"exercise": "<bài tập>"}}'
-                    )
-            cont_prompt = (
-                "In TIẾP đúng các dòng JSON còn thiếu, MỖI DÒNG 1 OBJECT, không giải thích, không mảng:\n" +
-                "\n".join(sk2)
-            )
-            messages2 = [
-                {"role": "system", "content": system_msg},
-                {"role": "user",   "content": cont_prompt},
-            ]
-            logger.info("Calling DeepInfra (continuation)…")
-            try:
-                resp2 = _llm_call(messages2, max_tokens=1200, temperature=0.0)
-            except Exception as api_error2:
-                logger.error(f"DeepInfra API error (pass2): {api_error2}")
-                return Response({"error": "Lỗi khi gọi AI service (bổ sung)"}, status=500)
+                    plan = fallback_plan(subject, goal)
 
-            text2 = (resp2.choices[0].message.content or "").strip()
-            lines2 = [ln for ln in text2.splitlines() if ln.strip()]
-            for ln in lines2:
-                try:
-                    obj = json.loads(ln)
-                    d = int(obj.get("day", 0))
-                    if 1 <= d <= 28:
-                        plan_objs[d] = obj
-                except Exception:
-                    continue
-
-        # --------- Hậu kiểm & chuẩn hoá từng object ---------
-        for d in range(1, 29):
-            if d not in plan_objs:
-                # tạo object tối thiểu nếu vẫn thiếu
-                plan_objs[d] = {
-                    "day": d,
-                    "content": f"Học {subject} theo mục tiêu {goal}",
-                    "keyword": FALLBACK_DOMAIN,
-                    "exercise": "15' thực hành",
-                    "tool": f"Google Classroom (môn {subject})" if d == 1 else None
-                }
-
-            # rút gọn content/exercise để ngắn gọn
-            plan_objs[d]["content"]  = _shorten(plan_objs[d].get("content", ""), 60)
-            plan_objs[d]["exercise"] = _shorten(plan_objs[d].get("exercise", ""), 60)
-
-            # chuẩn hoá domain keyword (không dùng whitelist)
-            _ensure_keyword_domain(plan_objs[d])
-            # chỉ ngày 1 có tool
-            _ensure_tool_only_day1(plan_objs[d], d, subject)
-
-        # --------- Lưu DB ---------
+        # Lưu DB (per user & subject)
         user = request.user
         try:
             with transaction.atomic():
-                deleted = ProgressLog.objects.filter(
+                deleted_count = ProgressLog.objects.filter(
                     user=user,
-                    subject=subject
+                    subject=subject,
                 ).delete()[0]
-                logger.info(f"Deleted {deleted} old progress logs")
+                logger.info(f"Deleted {deleted_count} old progress logs for subject={subject}")
 
                 objs = []
-                for day in range(1, 29):
-                    title = _make_task_title(day, plan_objs[day])
-                    week = (day - 1) // 7 + 1
-                    objs.append(ProgressLog(
-                        user=user,
-                        subject=subject,
-                        week=week,
-                        day_number=day,
-                        task_title=title,   # gộp ngắn gọn; tùy bạn mở rộng model để lưu 4 field
-                        status="pending",
-                    ))
-                ProgressLog.objects.bulk_create(objs)
-                logger.info(f"Created {len(objs)} progress logs")
+                for day_number in range(1, 29):
+                    task_text = str(plan[day_number])
+                    week = (day_number - 1) // 7 + 1
+                    objs.append(
+                        ProgressLog(
+                            user=user,
+                            subject=subject,
+                            week=week,
+                            day_number=day_number,
+                            task_title=task_text,
+                            status="pending",
+                        )
+                    )
+                created_logs = ProgressLog.objects.bulk_create(objs)
+                logger.info(f"Created {len(created_logs)} new progress logs")
         except Exception as db_error:
             logger.error(f"Database error: {db_error}")
+            logger.debug(traceback.format_exc())
             return Response({"error": "Lỗi lưu dữ liệu vào database"}, status=500)
 
-        logs = ProgressLog.objects.filter(
-            user=user,
-            subject=subject
-        ).order_by("week", "day_number")
-
-        raw_out = (text1 or "") + ("\n" + text2 if text2 else "")
+        # Trả về
+        logs = (
+            ProgressLog.objects.filter(user=user, subject=subject)
+            .order_by("week", "day_number")
+        )
         return Response(
             {
-                "message": "✅ Đã tạo lộ trình học 28 ngày (JSONL, không whitelist)!",
+                "message": "✅ Đã tạo lộ trình học 28 ngày!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
-                "raw_gpt_output": raw_out.strip()[:1200],
-                "model": LLM_MODEL,
+                "raw_gpt_output": gpt_text_vi[:2000],  # cắt ngắn để payload gọn
             },
             status=201,
         )
 
     except Exception as unexpected_error:
         logger.error(f"Unexpected error in generate_learning_path: {unexpected_error}")
-        import traceback
-        logger.error(f"Traceback: {traceback.format_exc()}")
+        logger.debug(traceback.format_exc())
         return Response(
             {"error": "Lỗi không xác định", "details": str(unexpected_error)[:200]},
             status=500,
         )
 
-# =========================================
-# Get progress list
-# =========================================
+
+# ------------------------------------------------------------------------------
+# API: Get progress list
+# ------------------------------------------------------------------------------
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_progress_list(request):
@@ -381,9 +336,10 @@ def get_progress_list(request):
         logger.error(f"Error in get_progress_list: {e}")
         return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
 
-# =========================================
-# Update progress status
-# =========================================
+
+# ------------------------------------------------------------------------------
+# API: Update progress status
+# ------------------------------------------------------------------------------
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_progress_status(request):
@@ -392,18 +348,12 @@ def update_progress_status(request):
         new_status_raw = request.data.get("status")
 
         if not log_id or new_status_raw is None:
-            return Response(
-                {"error": "Thiếu thông tin 'id' hoặc 'status'."},
-                status=400,
-            )
+            return Response({"error": "Thiếu thông tin 'id' hoặc 'status'."}, status=400)
 
         try:
             log = ProgressLog.objects.get(id=log_id, user=request.user)
         except ProgressLog.DoesNotExist:
-            return Response(
-                {"error": "Không tìm thấy bản ghi của bạn"},
-                status=404,
-            )
+            return Response({"error": "Không tìm thấy bản ghi của bạn"}, status=404)
 
         log.status = normalize_status(new_status_raw)
         log.save(update_fields=["status"])
@@ -416,14 +366,16 @@ def update_progress_status(request):
         logger.error(f"Error in update_progress_status: {e}")
         return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
 
-# =========================================
+
+# ------------------------------------------------------------------------------
 # Auth & CSRF endpoints
-# =========================================
+# ------------------------------------------------------------------------------
 @api_view(["GET"])
 @ensure_csrf_cookie
 @permission_classes([AllowAny])
 def get_csrf(request):
     return Response({"csrfToken": request.META.get("CSRF_COOKIE", "")})
+
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
@@ -437,24 +389,26 @@ def register(request):
         )
     return Response(serializer.errors, status=400)
 
+
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login_view(request):
     username = request.data.get("username")
     password = request.data.get("password")
     user = authenticate(request, username=username, password=password)
-
     if not user:
         return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
 
     login(request, user)
     return Response({"message": "Đăng nhập thành công!", "username": user.username})
 
+
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def logout_view(request):
     logout(request)
     return Response({"message": "Đã đăng xuất."})
+
 
 @api_view(["GET"])
 @permission_classes([AllowAny])
