@@ -69,7 +69,7 @@ def normalize_status(value: str) -> str:
 
 def build_prompt_vi(class_level: str, subject: str, study_time: str, goal: str) -> List[Dict[str, str]]:
     """
-    Tạo prompt tiếng Việt, ép LLM trả về 28 dòng đúng format.
+    Prompt tiếng Việt, ép LLM trả về 28 dòng đúng format.
     Mỗi dòng gồm: Tiêu đề, Kỹ năng, Hoạt động (bài tập/project/tài liệu), Tài nguyên, Tự kiểm.
     Ngày 28 bắt buộc có rubric/checklist chi tiết.
     """
@@ -103,50 +103,78 @@ Ngày N | Tiêu đề: <tiêu đề ngắn> | Kỹ năng: <kiến thức/kỹ n�
     ]
 
 
-# Regex bắt đúng đủ 6 trường, phân tách bằng " | "
-LINE_REGEX = re.compile(
-    r"^Ngày\s+(?P<day>\d{1,2})\s*\|\s*Tiêu đề:\s*(?P<title>[^|]+)\|\s*Kỹ năng:\s*(?P<skills>[^|]+)\|\s*Hoạt động:\s*(?P<activities>[^|]+)\|\s*Tài nguyên:\s*(?P<resources>[^|]+)\|\s*Tự kiểm:\s*(?P<selfcheck>.+)$",
-    re.IGNORECASE
-)
+# ----------------------- PARSER MỚI (THEO BLOCK) -----------------------------
+def _normalize_text(s: str) -> str:
+    """Chuẩn hoá pipe/khoảng trắng/ký tự full-width để regex bắt ổn định."""
+    if not s:
+        return ""
+    # Thay pipe full-width/biến thể -> |
+    s = s.replace("｜", "|").replace("¦", "|").replace("∣", "|")
+    # Chuẩn hoá khoảng trắng quanh |
+    s = re.sub(r"\s*\|\s*", " | ", s)
+    # Gom khoảng trắng dư
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
 
 
-def parse_plan_lines(text: str) -> Dict[int, str]:
+def parse_plan_blocks(text: str) -> Dict[int, str]:
     """
-    Parse 28 dòng theo format cố định. Lưu cả dòng gốc để hiển thị nguyên bản.
-    Trả về dict {day_number: full_line}.
+    Parse 28 block: 'Ngày 1 ...' cho đến trước 'Ngày 2', v.v.
+    Trả về {day: full_line_pretty} đã được chuẩn hoá.
+    Dù thiếu nhãn nào đó, vẫn chấp nhận block để tránh fallback.
     """
+    text = _normalize_text(text)
     plan: Dict[int, str] = {}
-    for raw in text.splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        m = LINE_REGEX.match(line)
+
+    for day in range(1, 29):
+        nxt = day + 1
+        # block Ngày N (đến trước Ngày N+1 hoặc hết chuỗi)
+        pat = re.compile(rf"\bNgày\s+{day}\b[\s\S]*?(?=\bNgày\s+{nxt}\b|$)", re.IGNORECASE)
+        m = pat.search(text)
         if not m:
-            # Bỏ các dòng không đúng định dạng
             continue
-        try:
-            day = int(m.group("day"))
-        except Exception:
+        block = _normalize_text(m.group(0))
+
+        # Hàm lấy nội dung theo nhãn (dừng trước nhãn kế tiếp hoặc hết block)
+        def grab(label_regex: str) -> str:
+            r = re.search(rf"({label_regex})\s*:\s*(.+?)(?=\s\|\s[A-ZÀ-ỹ]|$)", block, re.IGNORECASE)
+            return r.group(2).strip() if r else ""
+
+        title     = grab(r"Tiêu đề")
+        skills    = grab(r"Kỹ năng|Kiến thức|Kỹ năng/kiến thức")
+        activity  = grab(r"Hoạt động")
+        resources = grab(r"Tài nguyên")
+        selfcheck = grab(r"Tự kiểm|Tự đánh giá|Tự kiểm tra")
+
+        # Nếu thiếu tất cả nhãn, chuyển block kiểu “Ngày N: …” sang dòng chuẩn
+        if not any([title, skills, activity, resources, selfcheck]):
+            fixed = re.sub(rf"^Ngày\s+{day}\s*[:\-–]", f"Ngày {day} |", block, flags=re.IGNORECASE)
+            plan[day] = _normalize_text(fixed)
             continue
-        if 1 <= day <= 28:
-            plan[day] = line
+
+        pretty = (
+            f"Ngày {day} | Tiêu đề: {title or '(chưa có)'} | "
+            f"Kỹ năng: {skills or '(chưa có)'} | "
+            f"Hoạt động: {activity or '(chưa có)'} | "
+            f"Tài nguyên: {resources or '(chưa có)'} | "
+            f"Tự kiểm: {selfcheck or '(chưa có)'}"
+        )
+        plan[day] = pretty
+
     return plan
+# --------------------- HẾT PARSER MỚI (THEO BLOCK) ---------------------------
 
 
 def ensure_day28_has_rubric(full_line: str) -> bool:
-    """
-    Kiểm tra dòng Ngày 28 có chứa rubric/checklist (dựa theo từ khoá).
-    """
-    text = full_line.lower()
+    """Kiểm tra dòng Ngày 28 có chứa rubric/checklist (dựa theo từ khoá)."""
+    text = (full_line or "").lower()
     keywords = ["rubric", "checklist", "tiêu chí", "trọng số", "thang điểm", "ngưỡng"]
     return any(k in text for k in keywords)
 
 
 def fallback_plan(subject: str, goal: str) -> Dict[int, str]:
-    """
-    Kế hoạch dự phòng 28 dòng, đúng format để UI/DB không lỗi.
-    """
-    plan = {}
+    """Kế hoạch dự phòng 28 dòng, đúng format để UI/DB không lỗi."""
+    plan: Dict[int, str] = {}
     for day in range(1, 29):
         week = (day - 1) // 7 + 1
         title = "Ôn tập & Kiểm tra tổng hợp" if day == 28 else f"Chủ đề tuần {week}"
@@ -209,8 +237,8 @@ def generate_learning_path(request):
                 model=model,
                 messages=messages,
                 stream=False,
-                max_tokens=2400,  # đủ cho 28 dòng dài
-                temperature=0.5,  # cân bằng tính nhất quán & sáng tạo
+                max_tokens=3000,   # tăng để tránh bị cắt khi 28 block dài
+                temperature=0.5,   # cân bằng tính nhất quán & sáng tạo
             )
             logger.info("DeepInfra API call successful")
         except Exception as api_error:
@@ -243,9 +271,14 @@ def generate_learning_path(request):
             logger.error(f"Error parsing GPT response: {parse_error}")
             return Response({"error": "Lỗi xử lý phản hồi từ AI"}, status=500)
 
-        # === Parse 28 dòng ===
-        plan = parse_plan_lines(gpt_text_vi)
+        # === Parse 28 block theo định dạng mới ===
+        plan = parse_plan_blocks(gpt_text_vi)
         logger.info(f"Parsed {len(plan)} days from GPT response")
+
+        # Debug head khi thiếu để tìm nguyên nhân (bật tạm nếu cần)
+        # if len(plan) != 28:
+        #     sample = "\n".join(gpt_text_vi.splitlines()[:12])
+        #     logger.warning("Parsed %s/28 days; head sample:\n%s", len(plan), sample)
 
         # Validate 28 ngày
         if len(plan) != 28:
