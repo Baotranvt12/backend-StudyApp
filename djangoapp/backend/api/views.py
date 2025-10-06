@@ -1,21 +1,15 @@
 import os
 import re
 import logging
-import traceback
-from typing import Dict, List
-
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
-from django.views.decorators.csrf import ensure_csrf_cookie
 from django.contrib.auth.models import User
-
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework import status
-
+from django.views.decorators.csrf import ensure_csrf_cookie
 from openai import OpenAI
-
 from .models import ProgressLog
 from .serializers import (
     ProgressLogSerializer,
@@ -23,14 +17,14 @@ from .serializers import (
     UserSerializer,
 )
 
-# ------------------------------------------------------------------------------
-# Logging
-# ------------------------------------------------------------------------------
+# =========================
+# Logging setup
+# =========================
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------------------------
+# =========================
 # OpenAI (DeepInfra) client
-# ------------------------------------------------------------------------------
+# =========================
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
 
 logger.info(f"DEEPINFRA_API_KEY exists: {bool(DEEPINFRA_API_KEY)}")
@@ -56,158 +50,25 @@ except Exception as e:
     logger.error(f"Failed to initialize OpenAI client: {e}")
     raise
 
-# ------------------------------------------------------------------------------
+# =========================
 # Helpers
-# ------------------------------------------------------------------------------
+# =========================
 def normalize_status(value: str) -> str:
-    """Chuẩn hoá status bất kỳ về 'pending' hoặc 'done'."""
+    """Normalize arbitrary status strings into 'pending' or 'done'."""
     if not value:
         return "pending"
     v = value.strip().lower()
     return "done" if v == "done" else "pending"
 
 
-def build_prompt_vi(class_level: str, subject: str, study_time: str, goal: str) -> List[Dict[str, str]]:
-    """
-    Prompt tiếng Việt, ép LLM trả về 28 dòng đúng format.
-    Mỗi dòng gồm: Tiêu đề, Kỹ năng, Hoạt động (bài tập/project/tài liệu), Tài nguyên, Tự kiểm.
-    Ngày 28 bắt buộc có rubric/checklist chi tiết.
-    """
-    user_content = f"""
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}.
-Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
-
-YÊU CẦU BẮT BUỘC:
-- Theo chương trình Giáo dục phổ thông 2018 (Bộ GD&ĐT), đi từ cơ bản đến nâng cao.
-- Xuất RA CHÍNH XÁC 28 DÒNG, tương ứng Ngày 1 → Ngày 28.
-- KHÔNG thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
-- MỖI DÒNG PHẢI THEO ĐÚNG ĐỊNH DẠNG:
-
-Ngày N | Tiêu đề: <tiêu đề ngắn> | Kỹ năng: <kiến thức/kỹ năng cần đạt> | Hoạt động: <bài tập cụ thể / project nhỏ / nguồn tài liệu cần đọc/xem> | Tài nguyên: <sách/trang web/khóa học/công cụ> | Tự kiểm: <cách tự kiểm (Ngày 28: viết RUBRIC/Checklist chi tiết: tiêu chí, trọng số, thang điểm, ngưỡng đạt; Ngày 1–27: viết 1 câu tự kiểm ngắn)>
-
-- Ngày 28 bắt buộc có nội dung "ÔN TẬP & KIỂM TRA TỔNG HỢP" trong Tiêu đề và phần Tự kiểm phải là rubric/checklist chi tiết (tiêu chí, trọng số, thang điểm, ngưỡng đạt).
-- Chỉ in đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
-"""
-    return [
-        {
-            "role": "system",
-            "content": (
-                "Bạn là chuyên gia lập kế hoạch tự học (10+ năm kinh nghiệm) thiết kế lộ trình cá nhân hoá. "
-                "Trả lời HOÀN TOÀN bằng tiếng Việt, tuân thủ chặt chẽ định dạng yêu cầu."
-            ),
-        },
-        {
-            "role": "user",
-            "content": user_content.strip(),
-        },
-    ]
-
-
-# ----------------------- PARSER MỚI (THEO BLOCK) -----------------------------
-def _normalize_text(s: str) -> str:
-    """Chuẩn hoá pipe/khoảng trắng/ký tự full-width để regex bắt ổn định."""
-    if not s:
-        return ""
-    # Thay pipe full-width/biến thể -> |
-    s = s.replace("｜", "|").replace("¦", "|").replace("∣", "|")
-    # Chuẩn hoá khoảng trắng quanh |
-    s = re.sub(r"\s*\|\s*", " | ", s)
-    # Gom khoảng trắng dư
-    s = re.sub(r"[ \t]+", " ", s)
-    return s.strip()
-
-
-def parse_plan_blocks(text: str) -> Dict[int, str]:
-    """
-    Parse 28 block: 'Ngày 1 ...' cho đến trước 'Ngày 2', v.v.
-    Trả về {day: full_line_pretty} đã được chuẩn hoá.
-    Dù thiếu nhãn nào đó, vẫn chấp nhận block để tránh fallback.
-    """
-    text = _normalize_text(text)
-    plan: Dict[int, str] = {}
-
-    for day in range(1, 29):
-        nxt = day + 1
-        # block Ngày N (đến trước Ngày N+1 hoặc hết chuỗi)
-        pat = re.compile(rf"\bNgày\s+{day}\b[\s\S]*?(?=\bNgày\s+{nxt}\b|$)", re.IGNORECASE)
-        m = pat.search(text)
-        if not m:
-            continue
-        block = _normalize_text(m.group(0))
-
-        # Hàm lấy nội dung theo nhãn (dừng trước nhãn kế tiếp hoặc hết block)
-        def grab(label_regex: str) -> str:
-            r = re.search(rf"({label_regex})\s*:\s*(.+?)(?=\s\|\s[A-ZÀ-ỹ]|$)", block, re.IGNORECASE)
-            return r.group(2).strip() if r else ""
-
-        title     = grab(r"Tiêu đề")
-        skills    = grab(r"Kỹ năng|Kiến thức|Kỹ năng/kiến thức")
-        activity  = grab(r"Hoạt động")
-        resources = grab(r"Tài nguyên")
-        selfcheck = grab(r"Tự kiểm|Tự đánh giá|Tự kiểm tra")
-
-        # Nếu thiếu tất cả nhãn, chuyển block kiểu “Ngày N: …” sang dòng chuẩn
-        if not any([title, skills, activity, resources, selfcheck]):
-            fixed = re.sub(rf"^Ngày\s+{day}\s*[:\-–]", f"Ngày {day} |", block, flags=re.IGNORECASE)
-            plan[day] = _normalize_text(fixed)
-            continue
-
-        pretty = (
-            f"Ngày {day} | Tiêu đề: {title or '(chưa có)'} | "
-            f"Kỹ năng: {skills or '(chưa có)'} | "
-            f"Hoạt động: {activity or '(chưa có)'} | "
-            f"Tài nguyên: {resources or '(chưa có)'} | "
-            f"Tự kiểm: {selfcheck or '(chưa có)'}"
-        )
-        plan[day] = pretty
-
-    return plan
-# --------------------- HẾT PARSER MỚI (THEO BLOCK) ---------------------------
-
-
-def ensure_day28_has_rubric(full_line: str) -> bool:
-    """Kiểm tra dòng Ngày 28 có chứa rubric/checklist (dựa theo từ khoá)."""
-    text = (full_line or "").lower()
-    keywords = ["rubric", "checklist", "tiêu chí", "trọng số", "thang điểm", "ngưỡng"]
-    return any(k in text for k in keywords)
-
-
-def fallback_plan(subject: str, goal: str) -> Dict[int, str]:
-    """Kế hoạch dự phòng 28 dòng, đúng format để UI/DB không lỗi."""
-    plan: Dict[int, str] = {}
-    for day in range(1, 29):
-        week = (day - 1) // 7 + 1
-        title = "Ôn tập & Kiểm tra tổng hợp" if day == 28 else f"Chủ đề tuần {week}"
-        selfcheck = (
-            "Rubric: Tiêu chí (Hiểu bài 40%, Vận dụng 40%, Trình bày 20%); Thang điểm 10; Ngưỡng đạt ≥7."
-            if day == 28
-            else "Tự đánh giá bằng câu hỏi nhanh 3–5 phút."
-        )
-        plan[day] = (
-            f"Ngày {day} | Tiêu đề: {title} | "
-            f"Kỹ năng: {subject} liên quan đến {goal} | "
-            f"Hoạt động: Thực hành 15–30 phút theo mục tiêu ngày; ghi chép lại khó khăn | "
-            f"Tài nguyên: SGK/Video chính thống; công cụ Google Tài liệu/Slides | "
-            f"Tự kiểm: {selfcheck}"
-        )
-    return plan
-
-
-# ------------------------------------------------------------------------------
-# API: Generate learning path (store per-user)
-# ------------------------------------------------------------------------------
+# =========================================
+# Generate learning path (store per-user)
+# =========================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
     """
-    Body JSON:
-    {
-        "class_level": "10",
-        "subject": "Tin học",
-        "study_time": "1 giờ",
-        "goal": "Nắm vững Python cơ bản",
-        "model": "anthropic/claude-4-sonnet"   # (tuỳ chọn) override model
-    }
+    Generate a 4-week (28-day) personalized self-study plan.
     """
     try:
         logger.info(f"generate_learning_path called by user: {request.user.username}")
@@ -218,31 +79,56 @@ def generate_learning_path(request):
         subject = (data.get("subject") or "").strip()
         study_time = (data.get("study_time") or "").strip()
         goal = (data.get("goal") or "").strip()
-        # Mặc định dùng Anthropic Claude 4 Sonnet qua DeepInfra (OpenAI-compatible)
-        model = (data.get("model") or "anthropic/claude-4-sonnet").strip()
 
         if not all([class_level, subject, study_time, goal]):
             logger.warning("Missing required fields")
             return Response(
-                {"error": "Thiếu thông tin bắt buộc (class_level, subject, study_time, goal)."},
+                {"error": "Thiếu thông tin bắt buộc."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        messages = build_prompt_vi(class_level, subject, study_time, goal)
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Bạn là chuyên gia lập kế hoạch tự học, có hơn 10 năm kinh nghiệm thiết kế chương trình học tập cá nhân hoá. Trả lời HOÀN TOÀN bằng tiếng Việt."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
+Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, nhằm cải thiện môn {subject}. 
+Học sinh học {study_time} mỗi ngày. Mục tiêu: {goal}.
+YÊU CẦU:
+- Xuất ra CHÍNH XÁC 28 dòng (tương ứng Ngày 1 → Ngày 28). 
+- Mỗi dòng là một hoạt động học ngắn gọn, theo tiến trình từ cơ bản đến nâng cao. 
+- Nội dung theo chương trình Giáo dục phổ thông 2018 của Bộ Giáo dục và Đào tạo. 
+- Ngày 28 phải là phần ÔN TẬP & KIỂM TRA TỔNG HỢP. 
+- KHÔNG in thêm tiêu đề, KHÔNG giải thích, KHÔNG markdown, KHÔNG code block.
+Định dạng MỖI DÒNG:
+Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập ứng dụng thực tế> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ số học tập liên quan đến môn {subject}>
+Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác.
+""",
+            },
+        ]
 
-        # Gọi LLM
-        logger.info(f"Calling DeepInfra API with model={model} ...")
+        # =========================
+        # Call DeepInfra API
+        # =========================
+        logger.info("Calling DeepInfra API...")
         try:
             resp = openai.chat.completions.create(
-                model=model,
+                model="anthropic/claude-4-sonnet",  # ✅ Thay đổi model tại đây
                 messages=messages,
                 stream=False,
-                max_tokens=3000,   # tăng để tránh bị cắt khi 28 block dài
-                temperature=0.5,   # cân bằng tính nhất quán & sáng tạo
+                max_tokens=2000,
+                temperature=0.7,
             )
             logger.info("DeepInfra API call successful")
         except Exception as api_error:
             logger.error(f"DeepInfra API error: {str(api_error)}")
+            logger.error(f"Error type: {type(api_error).__name__}")
+
             error_message = str(api_error)
             if "api_key" in error_message.lower():
                 return Response(
@@ -256,59 +142,81 @@ def generate_learning_path(request):
                 )
             else:
                 return Response(
-                    {"error": "Lỗi khi gọi AI service", "details": error_message[:200]},
+                    {
+                        "error": "Lỗi khi gọi AI service",
+                        "details": str(api_error)[:200],
+                    },
                     status=500,
                 )
 
-        # Parse phản hồi
+        # =========================
+        # Parse model response
+        # =========================
         try:
             gpt_text_vi = (resp.choices[0].message.content or "").strip()
             logger.info(f"GPT response length: {len(gpt_text_vi)}")
+
             if not gpt_text_vi:
                 logger.error("Empty response from GPT")
-                return Response({"error": "Không nhận được phản hồi từ AI"}, status=500)
+                return Response(
+                    {"error": "Không nhận được phản hồi từ AI"},
+                    status=500,
+                )
         except Exception as parse_error:
             logger.error(f"Error parsing GPT response: {parse_error}")
-            return Response({"error": "Lỗi xử lý phản hồi từ AI"}, status=500)
+            return Response(
+                {"error": "Lỗi xử lý phản hồi từ AI"},
+                status=500,
+            )
 
-        # === Parse 28 block theo định dạng mới ===
-        plan = parse_plan_blocks(gpt_text_vi)
+        # =========================
+        # Parse "Ngày N: ..." lines
+        # =========================
+        line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
+        plan = {}
+
+        for raw_line in gpt_text_vi.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            m = line_regex.match(line)
+            if not m:
+                continue
+            try:
+                day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
+            except Exception:
+                continue
+            if 1 <= day_num <= 28:
+                plan[day_num] = line
+
         logger.info(f"Parsed {len(plan)} days from GPT response")
 
-        # Debug head khi thiếu để tìm nguyên nhân (bật tạm nếu cần)
-        # if len(plan) != 28:
-        #     sample = "\n".join(gpt_text_vi.splitlines()[:12])
-        #     logger.warning("Parsed %s/28 days; head sample:\n%s", len(plan), sample)
-
-        # Validate 28 ngày
+        # Fallback nếu không đủ 28 ngày
         if len(plan) != 28:
             logger.warning(f"Expected 28 days but got {len(plan)}. Fallback to default plan.")
-            plan = fallback_plan(subject, goal)
-        else:
-            # Bảo đảm ngày 28 có rubric/checklist
-            if 28 not in plan or not ensure_day28_has_rubric(plan[28]):
-                logger.warning("Day 28 missing detailed rubric. Injecting safe rubric.")
-                line28 = plan.get(28, "")
-                if line28:
-                    plan[28] = (
-                        line28.strip()
-                        + " (Rubric: Tiêu chí Hiểu bài 40%, Vận dụng 40%, Trình bày 20%; Thang điểm 10; Ngưỡng đạt ≥7)"
-                    )
-                else:
-                    plan = fallback_plan(subject, goal)
+            plan = {}
+            for day in range(1, 29):
+                week = (day - 1) // 7 + 1
+                plan[day] = (
+                    f"Ngày {day}: Học {subject} - Ôn tập/chủ đề liên quan {goal} | "
+                    f"TỪ KHÓA TÌM KIẾM: {subject} {goal} | "
+                    f"Bài tập tự luyện: Thực hành 15 phút | "
+                    f"CÔNG CỤ HỖ TRỢ: Google Classroom"
+                )
 
-        # Lưu DB (per user & subject)
+        # =========================
+        # Save to database
+        # =========================
         user = request.user
         try:
             with transaction.atomic():
                 deleted_count = ProgressLog.objects.filter(
-                    user=user,
-                    subject=subject,
+                    user=user, subject=subject
                 ).delete()[0]
-                logger.info(f"Deleted {deleted_count} old progress logs for subject={subject}")
+                logger.info(f"Deleted {deleted_count} old progress logs")
 
                 objs = []
-                for day_number in range(1, 29):
+                for day_number in sorted(plan.keys()):
                     task_text = str(plan[day_number])
                     week = (day_number - 1) // 7 + 1
                     objs.append(
@@ -321,40 +229,47 @@ def generate_learning_path(request):
                             status="pending",
                         )
                     )
+
                 created_logs = ProgressLog.objects.bulk_create(objs)
                 logger.info(f"Created {len(created_logs)} new progress logs")
         except Exception as db_error:
             logger.error(f"Database error: {db_error}")
-            logger.debug(traceback.format_exc())
-            return Response({"error": "Lỗi lưu dữ liệu vào database"}, status=500)
+            return Response(
+                {"error": "Lỗi lưu dữ liệu vào database"},
+                status=500,
+            )
 
-        # Trả về
-        logs = (
-            ProgressLog.objects.filter(user=user, subject=subject)
-            .order_by("week", "day_number")
-        )
+        logs = ProgressLog.objects.filter(
+            user=user, subject=subject
+        ).order_by("week", "day_number")
+
         return Response(
             {
-                "message": "✅ Đã tạo lộ trình học 28 ngày!",
+                "message": "✅ Đã tạo lộ trình học!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
-                "raw_gpt_output": gpt_text_vi[:2000],  # cắt ngắn để payload gọn
+                "raw_gpt_output": gpt_text_vi[:1000],
             },
             status=201,
         )
 
     except Exception as unexpected_error:
         logger.error(f"Unexpected error in generate_learning_path: {unexpected_error}")
-        logger.debug(traceback.format_exc())
+        import traceback
+        logger.error(f"Traceback: {traceback.format_exc()}")
+
         return Response(
-            {"error": "Lỗi không xác định", "details": str(unexpected_error)[:200]},
+            {
+                "error": "Lỗi không xác định",
+                "details": str(unexpected_error)[:200],
+            },
             status=500,
         )
 
 
-# ------------------------------------------------------------------------------
-# API: Get progress list
-# ------------------------------------------------------------------------------
+# =========================================
+# Get progress list
+# =========================================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_progress_list(request):
@@ -370,9 +285,9 @@ def get_progress_list(request):
         return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
 
 
-# ------------------------------------------------------------------------------
-# API: Update progress status
-# ------------------------------------------------------------------------------
+# =========================================
+# Update progress status
+# =========================================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_progress_status(request):
@@ -381,18 +296,27 @@ def update_progress_status(request):
         new_status_raw = request.data.get("status")
 
         if not log_id or new_status_raw is None:
-            return Response({"error": "Thiếu thông tin 'id' hoặc 'status'."}, status=400)
+            return Response(
+                {"error": "Thiếu thông tin 'id' hoặc 'status'."},
+                status=400,
+            )
 
         try:
             log = ProgressLog.objects.get(id=log_id, user=request.user)
         except ProgressLog.DoesNotExist:
-            return Response({"error": "Không tìm thấy bản ghi của bạn"}, status=404)
+            return Response(
+                {"error": "Không tìm thấy bản ghi của bạn"},
+                status=404,
+            )
 
         log.status = normalize_status(new_status_raw)
         log.save(update_fields=["status"])
 
         return Response(
-            {"message": "Cập nhật trạng thái thành công!", "item": ProgressLogSerializer(log).data},
+            {
+                "message": "Cập nhật trạng thái thành công!",
+                "item": ProgressLogSerializer(log).data,
+            },
             status=200,
         )
     except Exception as e:
@@ -400,9 +324,9 @@ def update_progress_status(request):
         return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
 
 
-# ------------------------------------------------------------------------------
+# =========================================
 # Auth & CSRF endpoints
-# ------------------------------------------------------------------------------
+# =========================================
 @api_view(["GET"])
 @ensure_csrf_cookie
 @permission_classes([AllowAny])
@@ -429,11 +353,17 @@ def login_view(request):
     username = request.data.get("username")
     password = request.data.get("password")
     user = authenticate(request, username=username, password=password)
+
     if not user:
-        return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
+        return Response(
+            {"detail": "Sai tên đăng nhập hoặc mật khẩu."},
+            status=400,
+        )
 
     login(request, user)
-    return Response({"message": "Đăng nhập thành công!", "username": user.username})
+    return Response(
+        {"message": "Đăng nhập thành công!", "username": user.username}
+    )
 
 
 @api_view(["POST"])
