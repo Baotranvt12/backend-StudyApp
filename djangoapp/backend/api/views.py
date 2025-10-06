@@ -1,6 +1,7 @@
 import os
 import re
 import logging
+import unicodedata  # ✅ để xử lý ký tự đặc biệt
 from django.db import transaction
 from django.contrib.auth import authenticate, login, logout
 from django.contrib.auth.models import User
@@ -118,7 +119,7 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
         logger.info("Calling DeepInfra API...")
         try:
             resp = openai.chat.completions.create(
-                model="anthropic/claude-4-sonnet",  # ✅ Thay đổi model tại đây
+                model="anthropic/claude-4-sonnet",  # ✅ model mới
                 messages=messages,
                 stream=False,
                 max_tokens=2000,
@@ -170,22 +171,29 @@ Chỉ in ra đúng 28 dòng theo mẫu trên, không thêm nội dung nào khác
             )
 
         # =========================
-        # Parse "Ngày N: ..." lines
+        # Parse "Ngày N: ..." lines (fixed)
         # =========================
-        line_regex = re.compile(r"^Ngày\s+(\d{1,2})\s*[:\-\–].+$", re.IGNORECASE)
+        line_regex = re.compile(r"^Ngày\s*(\d{1,2})\s*[:\-–]\s*(.+)$", re.IGNORECASE)
         plan = {}
 
         for raw_line in gpt_text_vi.splitlines():
-            line = raw_line.strip()
-            if not line:
+            # Làm sạch Unicode và khoảng trắng đặc biệt
+            line = unicodedata.normalize("NFKC", raw_line or "")
+            line = line.replace("\u00a0", " ").strip()
+
+            # Bỏ qua dòng trống hoặc không bắt đầu bằng "Ngày"
+            if not line or not line.lower().startswith("ngày"):
                 continue
+
             m = line_regex.match(line)
             if not m:
                 continue
+
             try:
-                day_num = int(re.search(r"Ngày\s+(\d{1,2})", line).group(1))
+                day_num = int(m.group(1))
             except Exception:
                 continue
+
             if 1 <= day_num <= 28:
                 plan[day_num] = line
 
