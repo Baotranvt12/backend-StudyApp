@@ -24,58 +24,37 @@ from .serializers import (
 logger = logging.getLogger(__name__)
 
 # =========================
-# OpenAI (DeepInfra) client
+# OpenAI (DeepInfra → Claude)
 # =========================
 DEEPINFRA_API_KEY = os.environ.get("DEEPINFRA_API_KEY")
 
-logger.info(f"DEEPINFRA_API_KEY exists: {bool(DEEPINFRA_API_KEY)}")
-if DEEPINFRA_API_KEY:
-    logger.info(f"API Key length: {len(DEEPINFRA_API_KEY)}")
-    logger.info(f"API Key first 10 chars: {DEEPINFRA_API_KEY[:10]}...")
-
 if not DEEPINFRA_API_KEY:
-    logger.error("DEEPINFRA_API_KEY environment variable is not set!")
-    if os.environ.get("DJANGO_DEBUG", "false").lower() == "true":
-        logger.warning("Using default API key for development only!")
-        DEEPINFRA_API_KEY = "your_development_key_here"
-    else:
-        raise ValueError("DEEPINFRA_API_KEY environment variable is required in production")
+    raise ValueError("Missing DEEPINFRA_API_KEY")
 
-try:
-    openai = OpenAI(
-        api_key=DEEPINFRA_API_KEY,
-        base_url="https://api.deepinfra.com/v1/openai",
-    )
-    logger.info("OpenAI client initialized successfully")
-except Exception as e:
-    logger.error(f"Failed to initialize OpenAI client: {e}")
-    raise
-
+openai = OpenAI(
+    api_key=DEEPINFRA_API_KEY,
+    base_url="https://api.deepinfra.com/v1/openai",
+)
 
 # =========================
-# Helpers
+# Helper
 # =========================
 def normalize_status(value: str) -> str:
-    """Normalize arbitrary status strings into 'pending' or 'done'."""
     if not value:
         return "pending"
     v = value.strip().lower()
     return "done" if v == "done" else "pending"
 
 
-# =========================================
-# Generate learning path (store per-user)
-# =========================================
+# =========================
+# Generate learning path
+# =========================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def generate_learning_path(request):
-    """
-    Gọi Claude tạo lộ trình 4 tuần (28 ngày) và lưu đúng từng dòng.
-    """
+    """Tạo kế hoạch tự học 4 tuần / 28 ngày"""
     try:
-        logger.info(f"generate_learning_path called by user: {request.user.username}")
-        logger.info(f"Request data: {request.data}")
-
+        logger.info(f"User: {request.user.username}")
         data = request.data
         class_level = (data.get("class_level") or "").strip()
         subject = (data.get("subject") or "").strip()
@@ -83,198 +62,181 @@ def generate_learning_path(request):
         goal = (data.get("goal") or "").strip()
 
         if not all([class_level, subject, study_time, goal]):
-            return Response({"error": "Thiếu thông tin bắt buộc."}, status=400)
+            return Response({"error": "Thiếu dữ liệu đầu vào."}, status=400)
 
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "Bạn là chuyên gia thiết kế lộ trình học, trả lời HOÀN TOÀN bằng tiếng Việt."
+                    "Bạn là chuyên gia lập kế hoạch học tập cá nhân hóa, trả lời hoàn toàn bằng tiếng Việt."
                 ),
             },
             {
                 "role": "user",
                 "content": f"""
-Hãy lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level} để học môn {subject}. 
-Thời gian học mỗi ngày: {study_time}, mục tiêu: {goal}.
-YÊU CẦU:
-- Xuất ra CHÍNH XÁC 28 dòng (Ngày 1 → Ngày 28).
-- Mỗi dòng dạng: 
-Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <gợi ý bài tập> | CÔNG CỤ HỖ TRỢ: <ứng dụng/công cụ>.
-- Tuyệt đối không thêm tiêu đề, markdown, code block.
+Lập kế hoạch tự học 4 tuần (28 ngày) cho học sinh lớp {class_level}, môn {subject}.
+Thời lượng học: {study_time}/ngày. Mục tiêu: {goal}.
+Yêu cầu:
+- Có 28 dòng, mỗi dòng tương ứng Ngày 1 → Ngày 28.
+- Mỗi dòng là 1 hoạt động học thực tế, đi từ cơ bản đến nâng cao.
+- Ngày 28 là ÔN TẬP & KIỂM TRA TỔNG HỢP.
+- Không markdown, không code block, không giải thích.
+Định dạng mỗi dòng:
+Ngày N: <nội dung> | TỪ KHÓA TÌM KIẾM: <từ khóa> | Bài tập tự luyện: <bài tập> | CÔNG CỤ HỖ TRỢ: <công cụ>
+Chỉ in đúng 28 dòng theo mẫu trên.
 """,
             },
         ]
 
-        # =========================
-        # Call AI API
-        # =========================
-        logger.info("Calling DeepInfra Claude API...")
-        try:
-            resp = openai.chat.completions.create(
-                model="anthropic/claude-4-sonnet",
-                messages=messages,
-                stream=False,
-                max_tokens=2500,
-                temperature=0.7,
-            )
-            logger.info("Claude API call successful")
-        except Exception as api_error:
-            logger.error(f"API Error: {api_error}")
-            return Response({"error": f"Lỗi gọi API: {api_error}"}, status=500)
+        logger.info("🧠 Calling Claude API (DeepInfra)...")
+        resp = openai.chat.completions.create(
+            model="anthropic/claude-4-sonnet",
+            messages=messages,
+            max_tokens=4000,  # <-- tăng giới hạn
+            temperature=0.4,  # <-- giảm để ổn định format
+            stream=False,
+        )
 
-        # Lấy nội dung
-        try:
-            gpt_text_vi = (resp.choices[0].message.content or "").strip()
-            if not gpt_text_vi:
-                raise ValueError("Empty response from Claude")
-        except Exception as e:
-            logger.error(f"Lỗi lấy dữ liệu từ Claude: {e}")
-            return Response({"error": "Không nhận được phản hồi từ AI"}, status=500)
+        gpt_text_vi = (resp.choices[0].message.content or "").strip()
+        if not gpt_text_vi:
+            return Response({"error": "Claude không trả về nội dung."}, status=500)
 
-        # =========================
-        # Parse từng dòng Claude trả về
-        # =========================
+        logger.info(f"Claude response length: {len(gpt_text_vi)}")
+
+        # ==============
+        # Parse output
+        # ==============
+        text_clean = (
+            unicodedata.normalize("NFKC", gpt_text_vi)
+            .replace("\u00a0", " ")
+            .strip()
+        )
+
+        lines = [l.strip() for l in text_clean.splitlines() if l.strip()]
         plan = {}
-        line_regex = re.compile(r"ngày\s*(\d{1,2})\s*[:\-–]\s*(.+)", re.IGNORECASE)
+        buffer = ""
 
-        for raw_line in gpt_text_vi.splitlines():
-            # Làm sạch Unicode & các ký tự khoảng trắng lạ
-            line = unicodedata.normalize("NFKC", raw_line or "").replace("\u00a0", " ").strip()
-            if not line:
-                continue
+        for line in lines:
+            # nếu là đầu "Ngày N"
+            if re.match(r"^ngày\s*\d{1,2}\b", line, flags=re.IGNORECASE):
+                # lưu dòng cũ
+                if buffer:
+                    m = re.search(r"ngày\s*(\d{1,2})", buffer, flags=re.IGNORECASE)
+                    if m:
+                        day = int(m.group(1))
+                        if 1 <= day <= 28:
+                            plan[day] = buffer.strip()
+                    buffer = line
+                else:
+                    buffer = line
+            else:
+                buffer += " " + line
 
-            m = line_regex.search(line)
-            if not m:
-                continue
+        # Lưu dòng cuối
+        if buffer:
+            m = re.search(r"ngày\s*(\d{1,2})", buffer, flags=re.IGNORECASE)
+            if m:
+                day = int(m.group(1))
+                if 1 <= day <= 28:
+                    plan[day] = buffer.strip()
 
-            try:
-                day_num = int(m.group(1))
-                content = m.group(0).strip()
-            except Exception:
-                continue
+        logger.info(f"📊 Parsed {len(plan)} unique days from Claude output")
 
-            if 1 <= day_num <= 28:
-                plan[day_num] = content
-
-        logger.info(f"Parsed {len(plan)} lines from Claude")
-
-        # =========================
-        # Fallback chỉ khi Claude thất bại (dưới 14 dòng)
-        # =========================
-        if len(plan) < 14:
-            logger.warning(f"Claude output chỉ có {len(plan)} dòng, dùng fallback mặc định")
-            plan = {}
-            for day in range(1, 29):
-                plan[day] = (
-                    f"Ngày {day}: Học {subject} - Ôn tập/chủ đề liên quan {goal} | "
-                    f"TỪ KHÓA TÌM KIẾM: {subject} {goal} | "
-                    f"Bài tập tự luyện: Thực hành 15 phút | "
+        # Nếu còn thiếu -> bổ sung placeholder
+        missing_days = [d for d in range(1, 29) if d not in plan]
+        if missing_days:
+            logger.warning(f"⚠️ Claude trả thiếu {len(missing_days)} ngày: {missing_days}")
+            for d in missing_days:
+                plan[d] = (
+                    f"Ngày {d}: Ôn tập kiến thức theo chủ đề | "
+                    f"TỪ KHÓA TÌM KIẾM: {subject} | "
+                    f"Bài tập tự luyện: Tự học, luyện thêm qua sách giáo khoa | "
                     f"CÔNG CỤ HỖ TRỢ: Google Classroom"
                 )
-        else:
-            logger.info("✅ Claude output hợp lệ, sử dụng nội dung thật")
+
+        logger.info(f"✅ Tổng số ngày: {len(plan)} (Expected 28)")
 
         # =========================
-        # Save vào database
+        # Save to DB
         # =========================
         user = request.user
-        try:
-            with transaction.atomic():
-                ProgressLog.objects.filter(user=user, subject=subject).delete()
+        with transaction.atomic():
+            ProgressLog.objects.filter(user=user, subject=subject).delete()
 
-                objs = []
-                for day_number in sorted(plan.keys()):
-                    week = (day_number - 1) // 7 + 1
-                    task_text = plan[day_number]
-
-                    objs.append(
-                        ProgressLog(
-                            user=user,
-                            subject=subject,
-                            week=week,
-                            day_number=day_number,
-                            task_title=task_text,
-                            status="pending",
-                        )
+            objs = []
+            for day_number in sorted(plan.keys()):
+                week = (day_number - 1) // 7 + 1
+                objs.append(
+                    ProgressLog(
+                        user=user,
+                        subject=subject,
+                        week=week,
+                        day_number=day_number,
+                        task_title=plan[day_number],
+                        status="pending",
                     )
-
-                ProgressLog.objects.bulk_create(objs)
-        except Exception as db_error:
-            logger.error(f"Lỗi database: {db_error}")
-            return Response({"error": "Lỗi lưu dữ liệu"}, status=500)
+                )
+            ProgressLog.objects.bulk_create(objs)
 
         logs = ProgressLog.objects.filter(user=user, subject=subject).order_by("week", "day_number")
-
         return Response(
             {
                 "message": "✅ Đã tạo lộ trình học!",
                 "subject": subject,
                 "items": ProgressLogSerializer(logs, many=True).data,
-                "raw_gpt_output": gpt_text_vi[:3000],  # trả về bản gốc Claude
+                "raw_gpt_output": gpt_text_vi[:2000],
             },
             status=201,
         )
 
-    except Exception as unexpected:
-        logger.error(f"Unexpected error in generate_learning_path: {unexpected}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return Response({"error": str(unexpected)}, status=500)
+    except Exception as e:
+        logger.exception("Error in generate_learning_path")
+        return Response(
+            {"error": "Lỗi hệ thống", "details": str(e)[:200]},
+            status=500,
+        )
 
 
-# =========================================
+# =========================
 # Get progress list
-# =========================================
+# =========================
 @api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def get_progress_list(request):
-    try:
-        subject = request.query_params.get("subject")
-        qs = ProgressLog.objects.filter(user=request.user).order_by("subject", "week", "day_number")
-        if subject:
-            qs = qs.filter(subject=subject)
-        return Response(ProgressLogSerializer(qs, many=True).data, status=200)
-    except Exception as e:
-        logger.error(f"Error loading progress list: {e}")
-        return Response({"error": "Lỗi lấy danh sách tiến độ"}, status=500)
+    subject = request.query_params.get("subject")
+    user = request.user
+    qs = ProgressLog.objects.filter(user=user)
+    if subject:
+        qs = qs.filter(subject=subject)
+    qs = qs.order_by("subject", "week", "day_number")
+    return Response(ProgressLogSerializer(qs, many=True).data)
 
 
-# =========================================
+# =========================
 # Update progress status
-# =========================================
+# =========================
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def update_progress_status(request):
+    log_id = request.data.get("id")
+    new_status = request.data.get("status")
+    if not log_id or not new_status:
+        return Response({"error": "Thiếu id hoặc status"}, status=400)
+
     try:
-        log_id = request.data.get("id")
-        new_status_raw = request.data.get("status")
-
-        if not log_id or new_status_raw is None:
-            return Response({"error": "Thiếu id hoặc trạng thái"}, status=400)
-
-        try:
-            log = ProgressLog.objects.get(id=log_id, user=request.user)
-        except ProgressLog.DoesNotExist:
-            return Response({"error": "Không tìm thấy bản ghi"}, status=404)
-
-        log.status = normalize_status(new_status_raw)
+        log = ProgressLog.objects.get(id=log_id, user=request.user)
+        log.status = normalize_status(new_status)
         log.save(update_fields=["status"])
         return Response(
-            {
-                "message": "✅ Cập nhật thành công",
-                "item": ProgressLogSerializer(log).data,
-            },
-            status=200,
+            {"message": "Cập nhật thành công", "item": ProgressLogSerializer(log).data}
         )
-    except Exception as e:
-        logger.error(f"update_progress_status error: {e}")
-        return Response({"error": "Lỗi cập nhật trạng thái"}, status=500)
+    except ProgressLog.DoesNotExist:
+        return Response({"error": "Không tìm thấy bản ghi"}, status=404)
 
 
-# =========================================
-# Auth & CSRF endpoints
-# =========================================
+# =========================
+# Auth handlers
+# =========================
 @api_view(["GET"])
 @ensure_csrf_cookie
 @permission_classes([AllowAny])
@@ -288,30 +250,29 @@ def register(request):
     serializer = RegisterSerializer(data=request.data)
     if serializer.is_valid():
         user = serializer.save()
-        return Response(
-            {"message": "Đăng ký thành công!", "user": UserSerializer(user).data},
-            status=201,
-        )
+        return Response({"user": UserSerializer(user).data}, status=201)
     return Response(serializer.errors, status=400)
 
 
 @api_view(["POST"])
 @permission_classes([AllowAny])
 def login_view(request):
-    username = request.data.get("username")
-    password = request.data.get("password")
-    user = authenticate(request, username=username, password=password)
+    user = authenticate(
+        request,
+        username=request.data.get("username"),
+        password=request.data.get("password"),
+    )
     if not user:
-        return Response({"detail": "Sai tên đăng nhập hoặc mật khẩu."}, status=400)
+        return Response({"error": "Sai tên đăng nhập hoặc mật khẩu"}, status=400)
     login(request, user)
-    return Response({"message": "Đăng nhập thành công!", "username": user.username})
+    return Response({"message": "Đăng nhập thành công", "username": user.username})
 
 
 @api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def logout_view(request):
     logout(request)
-    return Response({"message": "Đã đăng xuất."})
+    return Response({"message": "Đã đăng xuất"})
 
 
 @api_view(["GET"])
@@ -319,4 +280,4 @@ def logout_view(request):
 def whoami(request):
     if request.user.is_authenticated:
         return Response({"username": request.user.username})
-    return Response({"username": None}, status=200)
+    return Response({"username": None})
